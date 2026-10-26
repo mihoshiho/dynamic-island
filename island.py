@@ -8,12 +8,13 @@ import asyncio, bisect, calendar, collections, ctypes, datetime as dt, faulthand
 import http.server, ipaddress, secrets, shutil, socket, subprocess, urllib.request, winreg, winsound
 
 import psutil
+import segno
 from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
                             QVariantAnimation, QEasingCurve)
 from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QFileIconProvider,
                                QGraphicsOpacityEffect, QHBoxLayout, QLineEdit, QListView, QListWidget, QListWidgetItem,
-                               QMenu, QPushButton, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
+                               QLabel, QMenu, QPushButton, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
 from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as MediaManager
 from winrt.windows.globalization import Language
 from winrt.windows.graphics.imaging import BitmapDecoder, BitmapPixelFormat, SoftwareBitmap
@@ -36,15 +37,16 @@ FONT_DIR = pathlib.Path(getattr(sys, '_MEIPASS', pathlib.Path(__file__).parent))
 PREV, PLAY, PAUSE, NEXT = '\uE892', '\uE768', '\uE769', '\uE893'
 MUSIC, SYSTEM, TIMER, CALENDAR = '\uE8D6', '\uE9D9', '\uE916', '\uE787'
 PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
-COMPACT_H, TOP, WIN = 36, 8, (820, 430)
+COMPACT_H, TOP, WIN = 36, 8, (820, 470)
 GEAR, LYRICS = '', ''
 SHELF, MONEY, CLAUDE = '', '', ''
 TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'claude', 'timer', 'calendar', 'settings']
 SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 250), 'system': (540, 220), 'claude': (700, 220),
-         'timer': (400, 180), 'calendar': (580, 260), 'settings': (520, 416), 'alert': (400, 160)}
+         'timer': (400, 180), 'calendar': (580, 260), 'settings': (520, 446), 'alert': (400, 160),
+         'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.0.1'
+VERSION = '1.1.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -65,7 +67,7 @@ if FROZEN:  # a windowed .exe has no console: keep errors in a file so bugs can 
     threading.excepthook = lambda a: sys.excepthook(a.exc_type, a.exc_value, a.exc_traceback)
 DEFAULTS = {'tiny_fullscreen': True, 'compact_lyrics': True, 'sound': True, 'screen': 0,
             'translation': None, 'pronunciation': None, 'auto_update': True, 'phone_sync': False, 'phone_key': None,
-            'fox': True, 'fox_sleep': 7200}
+            'fox': True, 'fox_sleep': 7200, 'payday': 26, 'currency': '฿'}
 FOX_SLEEP_AFTER = [('30 min', 1800), ('1 hour', 3600), ('2 hours', 7200), ('3 hours', 10800)]
 TRANSLATIONS = [('Off', None), ('ไทย', 'th'), ('English', 'en'), ('日本語', 'ja')]
 PRONUNCIATIONS = [('Off', None), ('Romaji', 'romaji')]
@@ -280,7 +282,13 @@ def add_tx(tx, source, raw=''):
         return new
 
 
-PAYDAY = 26  # pay lands on the 26th-28th; with no 💼 Salary entry yet, cycles start on this day
+# payday: with no 💼 Salary entry yet, cycles start on this day of the month. Set in Settings or on the phone.
+money_prefs = {'payday': 26, 'currency': '฿'}
+CURRENCIES = ['฿', '$', '€', '£', '¥', '₩', '₹', '₱', '₫', 'RM', 'Rp', 'S$']
+
+
+def on_day(d, day):  # the 31st in a 30-day month is its last day
+    return d.replace(day=min(day, calendar.monthrange(d.year, d.month)[1]))
 
 
 def shift_month(d, months):
@@ -291,18 +299,20 @@ def shift_month(d, months):
 
 def pay_cycle(now):
     """(start, next payday) as midnights. A cycle starts on the day the latest 💼 Salary came in; without one in
-    the last 40 days, on the PAYDAY. The next payday is counted as the PAYDAY of the next month (the earliest
+    the last 40 days, on the payday. The next payday is counted as the payday of the next month (the earliest
     the money comes), so "can spend per day" never assumes money that isn't there yet."""
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today, payday = now.replace(hour=0, minute=0, second=0, microsecond=0), money_prefs['payday']
     with money_lock:
         paid = [t['ts'] for t in money if t['kind'] == 'in' and 'Salary' in (t.get('cat') or '')
                 and t['ts'] <= now.timestamp()]
     if paid and now.timestamp() - max(paid) < 40 * 86400:
         start = dt.datetime.fromtimestamp(max(paid)).replace(hour=0, minute=0, second=0, microsecond=0)
     else:
-        start = today.replace(day=PAYDAY) if today.day >= PAYDAY else shift_month(today.replace(day=PAYDAY), -1)
-    # pay is late (past the 26th, no new Salary yet): payday is tomorrow, never a day already gone
-    return start, max(shift_month(start.replace(day=PAYDAY), 1), today + dt.timedelta(days=1))
+        start = on_day(today, payday)
+        if start > today:
+            start = on_day(shift_month(today.replace(day=1), -1), payday)
+    # pay is late (past payday, no new Salary yet): payday is tomorrow, never a day already gone
+    return start, max(on_day(shift_month(start.replace(day=1), 1), payday), today + dt.timedelta(days=1))
 
 
 def money_totals(now=None):
@@ -345,7 +355,7 @@ TAILSCALE = ipaddress.ip_network('100.64.0.0/10')
 class MoneyHandler(http.server.BaseHTTPRequestHandler):
     """Receiver for the iPhone: Shortcuts POST bank texts, the web app reads and edits. Only private networks
     and Tailscale may connect, and every call carries the pairing key."""
-    key, icon = None, b''
+    key, icon, on_prefs = None, b'', None  # on_prefs: the island's set_money_pref
 
     def log_message(self, *a):  # no console in the packaged app
         pass
@@ -372,7 +382,8 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
         k = urllib.parse.parse_qs(url.query).get('k', [''])[0]
         if url.path == f'/app/{self.key}':
             theme = ';'.join(f'--{k}:{v}' for k, v in THEME.items())  # the island's colours, one source
-            return self.send(200, MONEY_APP.replace('__KEY__', self.key).replace('__THEME__', theme), 'text/html')
+            page = MONEY_APP.replace('__KEY__', self.key).replace('__THEME__', theme)
+            return self.send(200, page.replace('__CURRENCIES__', json.dumps(CURRENCIES, ensure_ascii=False)), 'text/html')
         if url.path == f'/manifest/{self.key}.json':
             return self.send(200, {'name': 'Island Money', 'short_name': 'Money', 'display': 'standalone',
                                    'start_url': f'/app/{self.key}', 'background_color': BG,
@@ -387,7 +398,7 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
         if url.path == '/api/tx' and secrets.compare_digest(k, self.key):
             with money_lock:
                 items = [{k2: v for k2, v in t.items() if k2 != 'raw'} for t in money[-2000:]]  # calendar history
-            return self.send(200, {'tx': items, 'totals': money_totals()})
+            return self.send(200, {'tx': items, 'totals': money_totals(), 'prefs': money_prefs})
         self.send(404, {'error': 'not found'})
 
     def do_POST(self):
@@ -464,6 +475,12 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                         money.sort(key=lambda x: x['ts'])
                 save_money()
             return self.send(200, {'ok': True})
+        if path == '/api/prefs':  # payday / currency changed on the phone
+            try:
+                self.on_prefs(**{k: v for k, v in body.items() if k in money_prefs})
+            except (TypeError, ValueError):
+                return self.send(400, {'error': 'bad payday or currency'})
+            return self.send(200, money_prefs)
         self.send(404, {'error': 'not found'})
 
 
@@ -499,6 +516,9 @@ button:focus-visible,input:focus-visible{outline:none;box-shadow:0 0 0 3px #ff9e
 form{display:grid;grid-template-columns:1fr auto;gap:8px}
 input{font:inherit;width:100%;padding:12px;border-radius:10px;border:0;background:var(--surface-2);color:var(--ink)}
 input::placeholder{color:var(--faint)}
+select{font:inherit;width:100%;padding:10px;border-radius:10px;border:0;background:var(--surface-2);color:var(--ink);
+ margin-top:4px;-webkit-appearance:none;appearance:none}
+.prefs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
 .seg{display:flex;gap:6px}.seg button.on{background:var(--sakura);color:var(--on-sakura);font-weight:700}.full{grid-column:1/-1}
 .steps{background:var(--surface);border-radius:14px;padding:6px 16px;color:var(--muted);font-size:14px;line-height:1.5}
 .steps b{color:var(--ink)}
@@ -537,7 +557,8 @@ details[open] summary::after{content:'▾'}
 <div class="cards"><div class="card"><small>Today</small><div class="big in" id="ti"></div><div class="big out" id="to"></div></div>
 <div class="card"><small id="cyc">Pay cycle</small><div class="big in" id="mi"></div><div class="big out" id="mo"></div></div>
 <div class="card wide"><div class="row2"><div><small>Avg spent / day</small><div class="big out" id="avg"></div></div>
-<div><small>Can spend / day</small><div class="big in" id="can"></div></div></div><small id="left"></small></div></div>
+<div><small>Can spend / day</small><div class="big in" id="can"></div></div></div><small id="left"></small>
+<div class="prefs"><label>Payday<select id="pd"></select></label><label>Currency<select id="cu"></select></label></div></div></div>
 <h2>Calendar</h2>
 <div class="calbox"><div class="calhead"><button type="button" id="prev" aria-label="Previous month">‹</button>
 <b id="mon"></b><button type="button" id="next" aria-label="Next month">›</button></div>
@@ -574,12 +595,19 @@ Get Contents of URL with <code>source</code> = <code>email</code>, <code>text</c
 Time of Day → Run Immediately → Find Photos (Album is K PLUS, Date Taken is today) → Repeat with Each →
 Extract Text from Image → Get Contents of URL with <code>source</code> = <code>slip</code>, <code>text</code> =
 Extracted Text. Sending a slip twice is harmless: copies are merged.</p>
-<p>Away from home Wi-Fi? Install Tailscale on the PC and the iPhone and use the island's Tailscale address.</p></details>
+<p>Away from home Wi-Fi? Install Tailscale on the PC and the iPhone and use the island's Tailscale address.</p>
+<p>Another bank? Its messages can't be read yet: add your money with <b>Add</b> above.</p></details>
 <script>
 const K='__KEY__',$=id=>document.getElementById(id);let kind='out',cat='';
 const CATS={out:['🍜 Food','🚆 Transport','🛍️ Shopping','💡 Bills','🎮 Fun','💊 Health','↔️ Transfer','📦 Other'],
  in:['💼 Salary','🎁 Gift','↩️ Refund','↔️ Transfer','🏷️ Sale','📦 Other']};
-const baht=n=>n.toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2})+' ฿';
+let CUR='฿';  // currency and payday come from the island's settings with every load
+const baht=n=>n.toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2})+' '+CUR;
+const nth=d=>d+({1:'st',2:'nd',3:'rd'}[d%10*(Math.floor(d/10)!=1)]||'th');
+for(let d=1;d<=31;d++)$('pd').add(new Option(nth(d)+' of the month',d));
+for(const c of __CURRENCIES__)$('cu').add(new Option(c,c));
+$('pd').onchange=async()=>{await post('/api/prefs',{payday:+$('pd').value});load()};
+$('cu').onchange=async()=>{await post('/api/prefs',{currency:$('cu').value});load()};
 const hhmm=d=>d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
 const local=ts=>{const d=new Date(ts*1000);return new Date(d-d.getTimezoneOffset()*6e4).toISOString().slice(0,16)};
 $('ep').textContent=location.origin+'/api/tx';
@@ -599,6 +627,7 @@ const dm=ts=>new Date(ts*1000).toLocaleDateString('en-GB',{day:'numeric',month:'
 async function load(){
  if($('sheet').classList.contains('on'))return;  // don't redraw under an open edit sheet
  const d=await (await fetch('/api/tx?k='+K)).json();txs=d.tx;tot=d.totals;const t=tot;
+ CUR=d.prefs.currency;$('pd').value=d.prefs.payday;$('cu').value=CUR;$('amt').placeholder='Amount '+CUR;
  $('ti').textContent='+'+baht(t.today_in);$('to').textContent='−'+baht(t.today_out);
  $('cyc').textContent='Pay cycle · '+dm(t.cycle_start)+' – '+dm(t.payday-86400);
  $('mi').textContent='+'+baht(t.cycle_in);$('mo').textContent='−'+baht(t.cycle_out);
@@ -706,8 +735,8 @@ async def read_slip(data):
     raise RuntimeError('no OCR language installed')
 
 
-def start_money_server(key, icon):
-    MoneyHandler.key, MoneyHandler.icon = key, icon
+def start_money_server(key, icon, on_prefs):
+    MoneyHandler.key, MoneyHandler.icon, MoneyHandler.on_prefs = key, icon, staticmethod(on_prefs)
     server = http.server.ThreadingHTTPServer(('0.0.0.0', MONEY_PORT), MoneyHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -1845,6 +1874,42 @@ class DayBars(QWidget):
                 p.drawText(QRectF(i * slot - 10, base - bh - 14, slot + 20, 12), Qt.AlignCenter, f'${v:.0f}')
 
 
+class QRCode(QWidget):
+    """A link as a QR code for the iPhone camera: dark squares on cream, rounded like the island."""
+
+    def __init__(self, size=120):
+        super().__init__()
+        self.setFixedSize(size, size)
+        self.text, self.matrix = None, ()
+
+    def set(self, text):
+        if text != self.text:
+            self.text = text
+            self.matrix = segno.make(text, error='m').matrix if text else ()
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        if not self.matrix:  # phone page off: an empty card where the code will be
+            p.setBrush(QColor(PANEL))
+            p.drawRoundedRect(self.rect(), 14, 14)
+            p.setPen(QColor(FAINT))
+            p.setFont(QFont(FONT, 9))
+            p.drawText(self.rect(), Qt.AlignCenter, 'QR code')
+            return
+        p.setBrush(QColor(THEME['fox-cream']))
+        p.drawRoundedRect(self.rect(), 14, 14)
+        n = len(self.matrix) + 6  # 3 light modules round the code so the camera finds its edge
+        cell = self.width() / n
+        p.setBrush(QColor(BG))
+        for y, line in enumerate(self.matrix):
+            for x, dark in enumerate(line):
+                if dark:
+                    p.drawRect(QRectF((x + 3) * cell, (y + 3) * cell, cell + 0.4, cell + 0.4))  # +0.4: no seams
+
+
 class TabBar(QWidget):
     """Tab icons centred at the top of the open island. The island is centred too, so the icons stay in the
     same screen spot when it resizes for another tab; a soft sakura pill slides to the active one."""
@@ -1983,6 +2048,10 @@ QComboBox::drop-down {{ border:none; width:0; }}
 QComboBox QAbstractItemView {{ background:{PANEL}; color:{FG}; selection-background-color:{SAKURA};
                                selection-color:{ON_SAKURA}; border:none; }}
 QToolTip {{ background:{PANEL}; color:{FG}; border:none; }}
+QLabel#body {{ color:{DIM}; font:10pt "{FONT}"; }}
+QPushButton#primary {{ background:{SAKURA}; color:{ON_SAKURA}; border:none; border-radius:12px; padding:4px 16px;
+                       font:bold 9pt "{FONT}"; }}
+QPushButton#primary:hover {{ background:{THEME['sakura-deep']}; }}
 '''
 
 
@@ -2003,6 +2072,7 @@ class Island(QWidget):
             if self.settings[key] not in [v for _, v in options]:  # e.g. Korean from an older version
                 self.settings[key] = None
         prefs.update(lang=self.settings['translation'], romaji=bool(self.settings['pronunciation']))
+        money_prefs.update(payday=self.settings['payday'], currency=self.settings['currency'])
         self.place()
         self.expanded, self.tab, self.alert, self.alert_at = False, None, None, 0
         self.timer_end, self.reminders, self.art_key, self.goal = None, load_reminders(), False, None
@@ -2021,6 +2091,8 @@ class Island(QWidget):
         self.set_phone_sync(self.settings['phone_sync'])
         self.shape = self.target()
         self.morph()
+        if first_run:  # a new user: say hello once the island is on screen
+            QTimer.singleShot(1200, self.open_guide)
         self.tick_timer = QTimer(self, timeout=self.tick, interval=100)
         self.tick_timer.start()
         QTimer(self, timeout=self.stats, interval=1000).start()
@@ -2140,11 +2212,12 @@ class Island(QWidget):
         self.m_link = Text(8, DIM)
         self.b_phone = pill_button('Connect iPhone', lambda: self.set_phone_sync(True))
         self.b_open = pill_button('Open', lambda: os.startfile(self.phone_url()) if self.phone_url() else None)
+        self.b_qr = pill_button('QR code', lambda: self.open_guide(2))  # the guide's phone step
         money_page = column(
             row(column(heads[0], self.m_totals[0], self.m_totals[1], spacing=0),
                 column(heads[1], self.m_totals[2], self.m_totals[3], spacing=0),
                 column(*(row(*r, spacing=6) for r in self.m_rows), None, spacing=2), spacing=18),
-            self.m_budget, None, row(self.m_link, self.b_phone, self.b_open, spacing=6), spacing=6)
+            self.m_budget, None, row(self.m_link, self.b_phone, self.b_qr, self.b_open, spacing=6), spacing=6)
         money_page.layout().itemAt(0).widget().layout().setStretch(2, 1)
         money_page.layout().itemAt(3).widget().layout().setStretch(0, 1)
 
@@ -2239,6 +2312,18 @@ class Island(QWidget):
         sleep_box.setCurrentIndex(next((i for i, (_, s) in enumerate(FOX_SLEEP_AFTER)
                                         if s == self.settings['fox_sleep']), 2))
         sleep_box.currentIndexChanged.connect(lambda i: self.set_setting('fox_sleep', FOX_SLEEP_AFTER[i][1]))
+        self.phone_switch = Switch(self.settings['phone_sync'], self.set_phone_sync)
+        # the same two pickers sit in Settings and in the guide; sync_money_widgets keeps them equal
+        self.payday_boxes, self.currency_boxes = [], []
+        for _ in range(2):
+            pay, cur = QComboBox(), QComboBox()
+            pay.addItems([f'{d}{ {1: "st", 2: "nd", 3: "rd"}.get(d % 10 * (d // 10 != 1), "th")}' for d in range(1, 32)])
+            pay.setMaxVisibleItems(12)
+            cur.addItems(CURRENCIES)
+            pay.currentIndexChanged.connect(lambda i: self.set_money_pref(payday=i + 1))
+            cur.currentIndexChanged.connect(lambda i: self.set_money_pref(currency=CURRENCIES[i]))
+            self.payday_boxes.append(pay)
+            self.currency_boxes.append(cur)
         settings_page = column(
             setting('Start with Windows', Switch(autostart(), autostart)),
             setting('Tiny island in fullscreen apps and games', toggle('tiny_fullscreen')),
@@ -2249,9 +2334,71 @@ class Island(QWidget):
             setting('Lyrics pronunciation', choice('pronunciation', PRONUNCIATIONS)),
             setting('Alert sound', toggle('sound')),
             setting(f'Auto update  ·  v{VERSION}', toggle('auto_update')),
-            setting('iPhone sync for Money', Switch(self.settings['phone_sync'], self.set_phone_sync)),
+            setting('iPhone sync for Money', self.phone_switch),
+            setting('Money: payday and currency', row(self.payday_boxes[0], self.currency_boxes[0], spacing=6)),
             setting('Screen', self.screen_box),
-            row(None, pill_button('Quit island', QApplication.quit)), spacing=6)
+            row(None, pill_button('Show guide', lambda: self.open_guide(0)), pill_button('Quit island', QApplication.quit)),
+            spacing=6)
+
+        # guide: a few steps on first start (and from Settings); the phone step also opens from the Money tab
+        def body(text):
+            label = QLabel(text, objectName='body', wordWrap=True)
+            label.setTextFormat(Qt.PlainText)
+            return label
+
+        def heading(text):
+            t = Text(15, SAKURA, bold=True, family=ROUND)
+            t.set(text)
+            return t
+
+        def labelled(text, widget):
+            t = Text(10)
+            t.set(text)
+            t.setFixedWidth(80)
+            return row(t, widget, None, spacing=8)
+
+        self.g_qr, self.g_link = QRCode(124), Text(8, DIM)
+        self.g_phone_on = pill_button('Turn on phone page', lambda: self.set_phone_sync(True))
+        steps = [
+            column(heading("Hi! I'm your Dynamic Island 🌸"), body(
+                'I sit at the top of your screen. Hover me to open, move the mouse away to close, '
+                'right-click me to quit.\n\nWhen nothing plays, a little fox runs around in me. In fullscreen games '
+                'I shrink to a thin bar.'), None, spacing=10),
+            column(heading("What's inside"), body(
+                'Music and Lyrics: whatever plays, YouTube too, with synced lyrics, romaji and translation.\n'
+                'Shelf: drop files on me, drag them out when you need them.\n'
+                'Money · System · Claude · Timer · Calendar: one icon each at the top.\n'
+                'Settings (the gear): everything else, and this guide again.'), None, spacing=10),
+            row(column(heading('Money on your iPhone'), body(
+                '1. Turn on the phone page. If Windows asks, click Allow.\n'
+                '2. Your iPhone must be on the same Wi-Fi as this PC. Away from home? Install Tailscale on both.\n'
+                '3. Scan the code with the iPhone camera and open it in Safari.\n'
+                "4. Share → Add to Home Screen. Don't need Money? Just click Next."),
+                row(self.g_phone_on, None), self.g_link, None, spacing=6),
+                column(None, self.g_qr, None), spacing=16),
+            column(heading('Payday'), body(
+                'Your pay cycle starts on payday, so I can tell how much you can spend each day. Mark your pay as '
+                '💼 Salary and the cycle starts on the day it really comes.\n'
+                'Bank messages are read for KBank only. With another bank, add money by hand on the phone.'),
+                labelled('Payday', self.payday_boxes[1]), labelled('Currency', self.currency_boxes[1]), None,
+                spacing=8),
+            column(heading('All set!'), body(
+                'I start with Windows (you can turn it off in Settings) and update myself.\n\n'
+                'Open this guide again any time: Settings → Show guide.'), None, spacing=10)]
+        self.g_steps = QStackedWidget()
+        for s in steps:
+            self.g_steps.addWidget(s)
+        self.g_dots = Text(9, DIM)
+        self.g_skip = pill_button('Skip', self.close_guide)
+        self.g_back = pill_button('Back', lambda: self.guide_step(-1))
+        self.g_next = QPushButton('Next', objectName='primary')
+        self.g_next.setCursor(Qt.PointingHandCursor)
+        self.g_next.setFocusPolicy(Qt.NoFocus)
+        self.g_next.clicked.connect(lambda: self.guide_step(1))
+        guide_page = column(self.g_steps, row(self.g_dots, None, self.g_skip, self.g_back, self.g_next, spacing=6),
+                            spacing=8)
+        guide_page.layout().setStretch(0, 1)
+        self.sync_money_widgets()
 
         # alert page
         self.a_text = Text(14, ORANGE, bold=True, align=Qt.AlignCenter)
@@ -2259,10 +2406,9 @@ class Island(QWidget):
                             spacing=12)
 
         self.pages = QStackedWidget()
-        for name, page in zip(TABS + ['alert'], (media_page, lyrics_page, shelf_page, money_page, system_page, claude_page,
-                                                 timer_page,
-                                                 calendar_page,
-                                                 settings_page, alert_page)):
+        for name, page in zip(TABS + ['alert', 'guide'], (media_page, lyrics_page, shelf_page, money_page, system_page,
+                                                          claude_page, timer_page, calendar_page, settings_page,
+                                                          alert_page, guide_page)):
             page.setObjectName(name)
             self.pages.addWidget(page)
         self.pages.setCurrentWidget(alert_page)  # first tick then switches page and colors the tabs
@@ -2295,10 +2441,10 @@ class Island(QWidget):
         self.set_setting('phone_sync', on)
         if on and not self.money_server:
             try:
-                self.money_server = start_money_server(self.settings['phone_key'], icon_png())
+                self.money_server = start_money_server(self.settings['phone_key'], icon_png(), self.set_money_pref)
             except OSError as e:  # port taken by another program
                 self.m_link.set(f'Phone sync failed: port {MONEY_PORT} busy ({e.strerror})', RED)
-                return
+                return self.sync_money_widgets()
         elif not on and self.money_server:
             self.money_server.shutdown()
             self.money_server.server_close()
@@ -2306,7 +2452,68 @@ class Island(QWidget):
         self.b_phone.setVisible(not self.money_server)
         self.b_open.setVisible(bool(self.money_server))
         self.m_link.set(f'iPhone: {self.phone_url()}  (Safari → Share → Add to Home Screen)' if self.money_server
-                        else 'Connect your iPhone to add KBank SMS, emails and slips', DIM)
+                        else 'Connect your iPhone to add money from bank SMS (KBank), slips or by hand', DIM)
+        self.sync_money_widgets()
+
+    def sync_money_widgets(self):
+        """Settings and guide pickers, phone switch and QR code follow the current values (they can change from
+        the phone, or from the other copy of a picker)."""
+        for box, i in ([(b, money_prefs['payday'] - 1) for b in self.payday_boxes] +
+                       [(b, CURRENCIES.index(money_prefs['currency'])) for b in self.currency_boxes]):
+            if box.currentIndex() != i:
+                box.blockSignals(True)
+                box.setCurrentIndex(i)
+                box.blockSignals(False)
+        on = bool(self.money_server)
+        if self.phone_switch.isChecked() != on:
+            self.phone_switch.blockSignals(True)
+            self.phone_switch.setChecked(on)
+            self.phone_switch.blockSignals(False)
+        self.g_qr.set(self.phone_url())
+        self.g_phone_on.setVisible(not on)
+        self.g_link.set(self.phone_url() or "The code shows here once the phone page is on.")
+
+    # --- guide ---
+    def open_guide(self, step=0):
+        self.expanded, self.tab = True, 'guide'
+        self.show_guide_step(step)
+        self.sync_money_widgets()
+        self.tick()
+
+    def show_guide_step(self, i):
+        n = self.g_steps.count()
+        self.g_steps.setCurrentIndex(i)
+        self.g_dots.set('  '.join('●' if k == i else '○' for k in range(n)))
+        self.g_back.setVisible(i > 0)
+        self.g_skip.setVisible(i < n - 1)
+        self.g_next.setText('Done' if i == n - 1 else 'Next')
+
+    def guide_step(self, delta):
+        i = self.g_steps.currentIndex() + delta
+        if i >= self.g_steps.count():
+            return self.close_guide()
+        self.show_guide_step(max(0, i))
+
+    def close_guide(self):
+        self.tab = None
+        self.tick()
+        self.maybe_collapse()
+
+    def set_money_pref(self, payday=None, currency=None):
+        """From Settings, the guide or the phone (server thread): only plain values change here; the widgets
+        catch up in tick."""
+        if payday is not None:
+            payday = int(payday)
+            if not 1 <= payday <= 31:
+                raise ValueError(payday)
+            money_prefs['payday'] = payday
+            self.set_setting('payday', payday)
+        if currency is not None:
+            if currency not in CURRENCIES:
+                raise ValueError(currency)
+            money_prefs['currency'] = currency
+            self.set_setting('currency', currency)
+        self.money_at = 0  # Money tab redraws on the next tick
 
     def phone_url(self):
         if not self.money_server:
@@ -2316,18 +2523,18 @@ class Island(QWidget):
         return f'http://{host}:{MONEY_PORT}/app/{self.settings["phone_key"]}'
 
     def refresh_money(self):
-        t = money_totals()
-        self.m_budget.set(f'Avg spent {t["avg_day"]:,.0f} ฿/day   ·   can spend {t["can_day"]:,.0f} ฿/day   ·   '
+        t, cur = money_totals(), money_prefs['currency']
+        self.m_budget.set(f'Avg spent {t["avg_day"]:,.0f} {cur}/day   ·   can spend {t["can_day"]:,.0f} {cur}/day   ·   '
                           f'payday in {t["days_left"]} day{"s" * (t["days_left"] != 1)}')
         for w, v, sign in zip(self.m_totals, (t['today_in'], t['today_out'], t['cycle_in'], t['cycle_out']),
                               '+−+−'):
-            w.set(f'{sign}{v:,.2f} ฿')
+            w.set(f'{sign}{v:,.2f} {cur}')
         with money_lock:
             latest = money[-4:][::-1]
         for (when, note, amount), tx in zip(self.m_rows, latest + [None] * 4):
             when.set(time.strftime('%d %b %H:%M', time.localtime(tx['ts'])) if tx else '')
             note.set(' · '.join(filter(None, (tx.get('cat'), tx['note']))) or tx['source'] if tx else '')
-            amount.set(f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} ฿' if tx else '',
+            amount.set(f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} {cur}' if tx else '',
                        (GREEN if tx['kind'] == 'in' else RED) if tx else None)
 
     def refresh_claude(self, now):
@@ -2467,7 +2674,8 @@ class Island(QWidget):
         inside = self.shape.contains(QPointF(self.mapFromGlobal(QCursor.pos())))
         focus = QApplication.focusWidget()
         typing = self.isActiveWindow() and focus is not None and self.full.isAncestorOf(focus)
-        if not inside and not typing and not self.alert and not self.shelf.dragging and not self.drop_hover:
+        if (not inside and not typing and not self.alert and not self.shelf.dragging and not self.drop_hover
+                and self.tab != 'guide'):  # the guide stays open until Skip or Done
             self.expanded, self.tab = False, None
             self.morph()
 
@@ -2580,8 +2788,8 @@ class Island(QWidget):
             self.tiny = self.settings['tiny_fullscreen'] and fullscreen_in_front(int(self.winId()))
         if money_last['at']:  # a new transaction from the iPhone, not shown yet
             tx = money_last['tx']
-            self.flash = (f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} ฿  ·  {tx["note"] or tx["source"]}',
-                          GREEN if tx['kind'] == 'in' else RED, money_last['at'] + 6, 320)
+            self.flash = (f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} {money_prefs["currency"]}  ·  '
+                          f'{tx["note"] or tx["source"]}', GREEN if tx['kind'] == 'in' else RED, money_last['at'] + 6, 320)
             money_last['at'] = 0
             self.refresh_money()
         end = claude_usage.get('window_end')
@@ -2645,9 +2853,9 @@ class Island(QWidget):
         self.f_lyric.set(lyric)
         if page == 'claude':
             self.refresh_claude(now)
-        if page == 'money' and now - self.money_at > 2:  # totals change slowly
+        if page in ('money', 'settings', 'guide') and now - self.money_at > 2:  # totals and pickers change slowly
             self.money_at = now
-            self.refresh_money()
+            self.refresh_money() if page == 'money' else self.sync_money_widgets()
         if page == 'lyrics':
             self.l_song.set(f'{title} · {media.get("artist", "")}' if title else 'Nothing playing')
             self.lyrics.show_lines(media.get('lyrics') or [], lyric_index())
@@ -2729,6 +2937,11 @@ def selftest():
                   'cat': '💼 Salary', 'note': '', 'source': 'manual'})
     assert pay_cycle(d(2026, 11, 2)) == (d(2026, 10, 28), d(2026, 11, 26))  # paid on the 28th: cycle from then
     assert pay_cycle(d(2026, 11, 27, 9)) == (d(2026, 10, 28), d(2026, 11, 28))  # pay late: payday tomorrow, not past
+    saved_money, money[:] = money[:], []
+    money_prefs['payday'] = 31  # set to the 31st: short months use their last day
+    assert pay_cycle(d(2027, 2, 10)) == (d(2027, 1, 31), d(2027, 2, 28))
+    assert pay_cycle(d(2026, 12, 1)) == (d(2026, 11, 30), d(2026, 12, 31))
+    money_prefs['payday'], money[:] = 26, saved_money
     usage = ClaudeUsage()
     for bad in (b'"text"', b'[1]', b'{"message": {"usage": {"output_tokens": 5}}, "timestamp": "not a time"}'):
         usage.add(bad)  # ignored, no error

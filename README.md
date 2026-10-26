@@ -8,8 +8,8 @@ open.
 - **Music**: cover, title, progress and controls for whatever plays, YouTube included.
 - **Lyrics**: time-synced lyrics with romaji and translation side by side.
 - **Shelf**: drop files on the island to keep them, drag them out to use them.
-- **Money**: income and expenses from KBank SMS, emails and slips, sent from your iPhone, by pay cycle, with a
-  calendar and how much you can spend per day until payday.
+- **Money**: income and expenses by pay cycle (your payday, your currency), with a calendar and how much you can
+  spend per day until payday. KBank SMS, emails and slips are read for you; other banks are added by hand.
 - **System**: CPU and RAM graphs, and the programs using the most CPU.
 - **Claude**: your Claude Code usage from its logs on this PC: the 5-hour window (how full, when it resets),
   today and the last 7 days, with the value at API prices.
@@ -27,3 +27,11 @@ open.
 
 Download `DynamicIsland-Setup-x.y.z.exe` from [Releases](https://github.com/mihoshiho/dynamic-island/releases) and
 run it. It updates itself.
+
+## How to use
+
+1. On first start a short guide opens in the island. You can see it again in Settings → Show guide.
+2. Hover the island to open it, move away to close it, right-click it to quit.
+3. For Money on your iPhone: Money tab → QR code. Turn on the phone page, scan the code with the iPhone camera,
+   open it in Safari, then Share → Add to Home Screen. If Windows asks, click Allow.
+4. Set your payday and currency in Settings or on the phone page.
