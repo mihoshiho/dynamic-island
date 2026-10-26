@@ -10,16 +10,20 @@ import http.server, ipaddress, secrets, shutil, socket, subprocess, urllib.reque
 import psutil
 from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QMimeData, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
                             QVariantAnimation, QEasingCurve)
-from PySide6.QtGui import QColor, QCursor, QFont, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
+from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QFileIconProvider,
                                QGraphicsOpacityEffect, QHBoxLayout, QLineEdit, QListView, QListWidget, QListWidgetItem,
                                QMenu, QPushButton, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
 from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as MediaManager
-from winrt.windows.storage.streams import Buffer, InputStreamOptions
+from winrt.windows.globalization import Language
+from winrt.windows.graphics.imaging import BitmapDecoder, BitmapPixelFormat, SoftwareBitmap
+from winrt.windows.media.ocr import OcrEngine
+from winrt.windows.storage.streams import Buffer, DataWriter, InMemoryRandomAccessStream, InputStreamOptions
 
 BG, PANEL, FG, DIM, GREEN, ORANGE, RED = '#000000', '#1c1c1e', '#ffffff', '#8e8e93', '#30d158', '#ff9f0a', '#ff453a'
 BLUE, PURPLE = '#0a84ff', '#bf5af2'
-FONT = 'Segoe UI'
+FONT = 'Noto Sans'  # Japanese falls back to Kiwi Maru, Thai to Noto Sans Thai (see load_fonts)
+FONT_DIR = pathlib.Path(getattr(sys, '_MEIPASS', pathlib.Path(__file__).parent)) / 'fonts'  # bundled in the .exe
 PREV, PLAY, PAUSE, NEXT = '\uE892', '\uE768', '\uE769', '\uE893'
 MUSIC, SYSTEM, TIMER, CALENDAR = '\uE8D6', '\uE9D9', '\uE916', '\uE787'
 PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
@@ -31,7 +35,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money'
          'timer': (400, 180), 'calendar': (580, 260), 'settings': (460, 330), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.1.0'
+VERSION = '1.2.1'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -203,13 +207,14 @@ def thai_year(y):
 def parse_tx(text, source):
     """Read a KBank SMS, alert email or slip (OCR text) -> {'ts', 'amount', 'kind'} or None.
     shortcut: keyword rules from common K PLUS wording; unknown wording falls back to "out", fixable in the app."""
+    text = re.sub(r'(?<=[฀-๿]) +(?=[฀-๿])', '', text)  # OCR puts spaces inside Thai words
     low = text.lower()
     # balances and fees are amounts too, but not the transaction's
     body = re.sub(r'(คงเหลือ|ยอดเงินคงเหลือ|balance|available|ค่าธรรมเนียม|fee)[^\d]{0,20}' + AMOUNT, ' ', text,
                   flags=re.I)
     m = (re.search(r'(?:จำนวน(?:เงิน)?|amount(?:\s*\(thb\))?|ยอดเงิน)\s*[:：]?\s*' + AMOUNT, body, re.I)
          or re.search(AMOUNT + r'\s*(?:บาท|บ\.?(?![ก-๙])|thb|baht)', body, re.I)
-         or re.search(r'\d+\.\d{2}', body))
+         or re.search(r'\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2}', body))  # keeps "1,280.50" whole
     if not m:
         return None
     amount = float((m.group(1) if m.groups() else m.group(0)).replace(',', ''))
@@ -220,14 +225,16 @@ def parse_tx(text, source):
     d = re.search(r'(\d{1,2})/(\d{1,2})/(\d{2,4})\D{0,3}(\d{1,2})[:.](\d{2})', text)
     t = re.search(r'(\d{1,2})\s*(' + '|'.join(map(re.escape, THAI_MONTHS)) + r')\s*(\d{2,4})\D{0,6}(\d{1,2})[:.](\d{2})',
                   text)
+    dated = False
     try:
         if d:
-            ts = dt.datetime(thai_year(d[3]), int(d[2]), int(d[1]), int(d[4]), int(d[5])).timestamp()
+            ts, dated = dt.datetime(thai_year(d[3]), int(d[2]), int(d[1]), int(d[4]), int(d[5])).timestamp(), True
         elif t:
-            ts = dt.datetime(thai_year(t[3]), THAI_MONTHS.index(t[2]) + 1, int(t[1]), int(t[4]), int(t[5])).timestamp()
+            ts, dated = dt.datetime(thai_year(t[3]), THAI_MONTHS.index(t[2]) + 1, int(t[1]), int(t[4]),
+                                    int(t[5])).timestamp(), True
     except ValueError:  # impossible date in the text: keep "now"
         pass
-    return {'ts': ts, 'amount': amount, 'kind': kind}
+    return {'ts': ts, 'amount': amount, 'kind': kind, 'dated': dated}
 
 
 def load_money():
@@ -330,6 +337,10 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                                                                         'type': 'image/png'}]})
         if url.path == '/icon.png':
             return self.send(200, self.icon, 'image/png')
+        if url.path.startswith('/fonts/'):  # only the bundled files, never a path the client makes up
+            name = url.path[len('/fonts/'):]
+            if name in {f.name for f in FONT_DIR.glob('*.ttf')}:
+                return self.send(200, (FONT_DIR / name).read_bytes(), 'font/ttf')
         if url.path == '/api/tx' and secrets.compare_digest(k, self.key):
             with money_lock:
                 items = [{k2: v for k2, v in t.items() if k2 != 'raw'} for t in money[-300:]]
@@ -339,13 +350,32 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed():
             return self.send(403, {'error': 'not allowed'})
+        url = urllib.parse.urlparse(self.path)
+        if url.path == '/api/slip':  # slip image from "Import slips" in the phone app
+            q = urllib.parse.parse_qs(url.query)
+            if not secrets.compare_digest(q.get('k', [''])[0], self.key):
+                return self.send(403, {'error': 'wrong key'})
+            size = int(self.headers.get('Content-Length', 0))
+            if not 0 < size <= 10 * 2**20:
+                return self.send(413, {'error': 'image too big'})
+            try:
+                text, lang = asyncio.run(read_slip(self.rfile.read(size)))
+            except Exception:  # not an image Windows can decode
+                return self.send(422, {'error': 'not a readable image'})
+            tx = parse_tx(text, 'slip')
+            if not tx:
+                return self.send(422, {'error': 'no amount found', 'lang': lang})
+            if not tx['dated'] and q.get('ts'):  # date unreadable (English OCR drops the Thai month): photo's time
+                tx['ts'] = float(q['ts'][0]) / 1000
+            tx['note'] = 'KBank slip'
+            return self.send(200, {**add_tx(tx, 'slip', text), 'lang': lang})
         try:
             body = json.loads(self.rfile.read(min(int(self.headers.get('Content-Length', 0)), 65536)) or b'{}')
         except ValueError:
             return self.send(400, {'error': 'bad json'})
         if not secrets.compare_digest(str(body.get('key', '')), self.key):
             return self.send(403, {'error': 'wrong key'})
-        path = urllib.parse.urlparse(self.path).path
+        path = url.path
         if path == '/api/tx':
             source = str(body.get('source') or 'manual')[:12]
             if body.get('amount') not in (None, ''):  # typed in the app
@@ -384,9 +414,15 @@ MONEY_APP = '''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="manifest" href="/manifest/__KEY__.json"><link rel="apple-touch-icon" href="/icon.png">
 <title>Island Money</title><style>
+@font-face{font-family:'Noto Sans';font-weight:400;src:url(/fonts/NotoSans-Regular.ttf)}
+@font-face{font-family:'Noto Sans';font-weight:600 700;src:url(/fonts/NotoSans-Bold.ttf)}
+@font-face{font-family:'Noto Sans Thai';font-weight:400;src:url(/fonts/NotoSansThai-Regular.ttf)}
+@font-face{font-family:'Noto Sans Thai';font-weight:600 700;src:url(/fonts/NotoSansThai-Bold.ttf)}
+@font-face{font-family:'Kiwi Maru';font-weight:400;src:url(/fonts/KiwiMaru-Regular.ttf);unicode-range:U+3000-30FF,U+4E00-9FFF,U+FF00-FFEF}
+@font-face{font-family:'Kiwi Maru';font-weight:500 700;src:url(/fonts/KiwiMaru-Medium.ttf);unicode-range:U+3000-30FF,U+4E00-9FFF,U+FF00-FFEF}
 :root{--bg:#000;--card:#1c1c1e;--line:#2c2c2e;--fg:#fff;--dim:#8e8e93;--in:#30d158;--out:#ff453a;--blue:#0a84ff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px -apple-system,system-ui,sans-serif;
+body{margin:0;background:var(--bg);color:var(--fg);font:16px 'Noto Sans','Kiwi Maru','Noto Sans Thai',-apple-system,sans-serif;
  padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 24px)}
 h1{font-size:28px;margin:18px 0 12px}h2{font-size:13px;color:var(--dim);font-weight:600;text-transform:uppercase;margin:22px 4px 8px}
 .cards{display:grid;grid-template-columns:1fr 1fr;gap:10px}.card{background:var(--card);border-radius:14px;padding:14px}
@@ -410,6 +446,9 @@ code{background:#000;padding:2px 6px;border-radius:6px;word-break:break-all;font
 <form id="f"><input id="amt" inputmode="decimal" placeholder="Amount ฿" required>
 <div class="seg"><button type="button" id="bo" class="on">Out</button><button type="button" id="bi">In</button></div>
 <input id="note" class="full" placeholder="Note (food, salary…)"><button class="full" style="background:var(--blue)">Add</button></form>
+<h2>Import slips</h2>
+<button id="pick" style="width:100%">Choose K PLUS slips from Photos</button>
+<input id="files" type="file" accept="image/*" multiple hidden><p class="s" id="st" style="color:var(--dim);margin:8px 4px"></p>
 <h2>History</h2><div class="list" id="list"></div>
 <h2>iPhone Shortcuts setup</h2><div class="steps">
 <p>Each Shortcut ends with <b>Get Contents of URL</b>: URL <code id="ep"></code>, Method <b>POST</b>,
@@ -419,8 +458,10 @@ Request Body <b>JSON</b> with <code>key</code> = <code>__KEY__</code>, <code>sou
 Get Contents of URL with <code>source</code> = <code>sms</code>, <code>text</code> = Shortcut Input.</p>
 <p><b>2. KBank email</b> — Automation → Email → Sender = KBank's alert address → Run Immediately →
 Get Contents of URL with <code>source</code> = <code>email</code>, <code>text</code> = Shortcut Input.</p>
-<p><b>3. Slip</b> — new Shortcut, Show in Share Sheet, accepts Images → Extract Text from Image →
-Get Contents of URL with <code>source</code> = <code>slip</code>, <code>text</code> = Text. Share a slip → this Shortcut.</p>
+<p><b>3. Slips</b> — easiest: <b>Import slips</b> above. Or, to send them by itself every night: Automation →
+Time of Day → Run Immediately → Find Photos (Album is K PLUS, Date Taken is today) → Repeat with Each →
+Extract Text from Image → Get Contents of URL with <code>source</code> = <code>slip</code>, <code>text</code> =
+Extracted Text. Sending a slip twice is harmless: copies are merged.</p>
 <p>Away from home Wi-Fi? Install Tailscale on the PC and the iPhone and use the island's Tailscale address.</p></div>
 <script>
 const K='__KEY__',$=id=>document.getElementById(id);let kind='out';
@@ -447,11 +488,44 @@ async function load(){
   del.onclick=async()=>{if(confirm('Delete this entry?')){await post('/api/edit',{id:x.id,delete:true});load()}};
   r.querySelector('.n').onclick=async()=>{const n=prompt('Note',x.note);if(n!==null){await post('/api/edit',{id:x.id,note:n});load()}};
   L.appendChild(r)}}
+async function shrink(f){  // phone photos are huge: send at most 2000 px, as JPEG (also turns HEIC into JPEG)
+ const b=await createImageBitmap(f),s=Math.min(1,2000/Math.max(b.width,b.height)),c=document.createElement('canvas');
+ c.width=Math.round(b.width*s);c.height=Math.round(b.height*s);c.getContext('2d').drawImage(b,0,0,c.width,c.height);
+ return new Promise(r=>c.toBlob(r,'image/jpeg',0.9))}
+$('pick').onclick=()=>$('files').click();
+$('files').onchange=async()=>{
+ const fs=[...$('files').files];let ok=0,bad=0,noThai=false;
+ for(const [i,f] of fs.entries()){
+  $('st').textContent=`Reading slip ${i+1} of ${fs.length}…`;
+  try{const r=await fetch(`/api/slip?k=${K}&ts=${f.lastModified}`,{method:'POST',headers:{'Content-Type':'image/jpeg'},body:await shrink(f)});
+   const d=await r.json();if(r.ok)ok++;else bad++;if(d.lang&&d.lang!='th')noThai=true}catch(e){bad++}}
+ $('st').textContent=`${ok} slip${ok==1?'':'s'} added`+(bad?`, ${bad} not readable`:'')+
+  (noThai?' · Thai OCR is not installed on the PC, so dates come from the photo':'');
+ $('files').value='';load()};
 $('f').onsubmit=async e=>{e.preventDefault();
  await post('/api/tx',{amount:$('amt').value.replace(/,/g,''),kind,note:$('note').value,source:'manual'});
  $('amt').value='';$('note').value='';load()};
 load();setInterval(load,5000);
 </script></body></html>'''
+
+
+async def read_slip(data):
+    """Text of a slip image via Windows' built-in OCR -> (text, language used). Thai needs Windows' Thai OCR pack;
+    without it English OCR still finds the amount, but not the Thai words or the month."""
+    stream = InMemoryRandomAccessStream()
+    writer = DataWriter(stream)
+    writer.write_bytes(data)
+    await writer.store_async()
+    writer.detach_stream()
+    stream.seek(0)
+    bitmap = await (await BitmapDecoder.create_async(stream)).get_software_bitmap_async()
+    bitmap = SoftwareBitmap.convert(bitmap, BitmapPixelFormat.BGRA8)  # the OCR engine wants 8-bit BGRA or gray
+    for tag in ('th', 'en-US'):
+        engine = OcrEngine.try_create_from_language(Language(tag))
+        if engine:
+            result = await engine.recognize_async(bitmap)
+            return '\n'.join(line.text for line in result.lines), tag
+    raise RuntimeError('no OCR language installed')
 
 
 def start_money_server(key, icon):
@@ -481,6 +555,14 @@ def icon_png(size=180):
     buf.open(QBuffer.WriteOnly)
     img.save(buf, 'PNG')
     return bytes(buf.data())
+
+
+def load_fonts():
+    """Register the bundled fonts. Noto Sans has no Japanese or Thai, so Qt takes each such character from the
+    substitutes in order: Kiwi Maru for kana and kanji, Noto Sans Thai for Thai, then Segoe UI for the rest."""
+    for f in sorted(FONT_DIR.glob('*.ttf')):
+        QFontDatabase.addApplicationFont(str(f))
+    QFont.insertSubstitutions(FONT, ['Kiwi Maru', 'Noto Sans Thai', 'Segoe UI'])
 
 
 def single_instance():
@@ -1257,6 +1339,7 @@ QComboBox QAbstractItemView {{ background:{PANEL}; color:white; selection-backgr
 # ---------- island ----------
 class Island(QWidget):
     def __init__(self):
+        load_fonts()  # before any widget picks its font
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         first_run = not SETTINGS_FILE.exists()
@@ -1308,7 +1391,7 @@ class Island(QWidget):
 
     def build(self):
         # compact: art | text | waveform or countdown
-        self.c_art = Art(24, 7)
+        self.c_art = Art(24, 12)  # round, matching the pill's ends
         self.c_text = Text(10, bold=True, align=Qt.AlignCenter)
         self.c_wave = Wave(20, 14)
         self.c_timer = Text(10, ORANGE, bold=True, align=Qt.AlignRight)
@@ -1889,15 +1972,18 @@ def selftest():
     assert snapshot()[os.getpid()][0].lower().startswith('python')
     when = dt.datetime(2026, 10, 26, 14, 5).timestamp()
     sms_in = parse_tx('26/10/69 14:05 บชX1234X รับโอนจากX5678X 500.00บ คงเหลือ 12,345.67บ', 'sms')
-    assert sms_in == {'ts': when, 'amount': 500.0, 'kind': 'in'}, sms_in
+    assert sms_in == {'ts': when, 'amount': 500.0, 'kind': 'in', 'dated': True}, sms_in
     sms_out = parse_tx('26/10/69 18:30 บชX1234X โอนเงิน 1,250.00บ คงเหลือ 11,095.67บ', 'sms')
     assert sms_out['kind'] == 'out' and sms_out['amount'] == 1250.0
     mail = parse_tx('Transaction Date: 26/10/2026 09:15 Transaction: Transfer to X5678 Amount (THB): 2,000.00 '
                     'Fee (THB): 0.00 Available Balance (THB): 9,095.67', 'email')
     assert mail['kind'] == 'out' and mail['amount'] == 2000.0, mail
     slip = parse_tx('โอนเงินสำเร็จ\n26 ต.ค. 69 14:05 น.\nนาย ก\nจำนวน:\n350.00 บาท\nค่าธรรมเนียม:\n0.00 บาท', 'slip')
-    assert slip == {'ts': when, 'amount': 350.0, 'kind': 'out'}, slip
+    assert slip == {'ts': when, 'amount': 350.0, 'kind': 'out', 'dated': True}, slip
     assert parse_tx('สวัสดีครับ', 'sms') is None
+    ocr_en = parse_tx('27 n.n. 69 09:41 u.\nunti\nxxx-x-xl 234-x\n<-nnu:\n1,280.50\n0.00', 'slip')  # no Thai OCR
+    assert ocr_en['amount'] == 1280.5 and not ocr_en['dated'], ocr_en
+    assert parse_tx('จ ำ น ว น : 99.00 บ า ท', 'slip')['amount'] == 99.0  # Thai OCR's spaced-out letters
     global MONEY_FILE
     saved_file, MONEY_FILE = MONEY_FILE, pathlib.Path(os.environ.get('TEMP', '.')) / 'island_money_test.json'
     money.clear()

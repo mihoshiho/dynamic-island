@@ -2,7 +2,8 @@
 param([string]$Version = (Select-String -Path island.py -Pattern "^VERSION = '(.+)'").Matches[0].Groups[1].Value)
 $ErrorActionPreference = 'Stop'
 
-python -m PyInstaller --noconfirm --windowed --name DynamicIsland --icon icon.ico --exclude-module tkinter island.py
+python -m PyInstaller --noconfirm --windowed --name DynamicIsland --icon icon.ico --exclude-module tkinter `
+    --add-data "fonts;fonts" island.py
 if ($LASTEXITCODE) { throw 'PyInstaller failed' }
 # software OpenGL fallback (20 MB) and Qt translations: the island draws without OpenGL and has its own text
 Remove-Item dist\DynamicIsland\_internal\PySide6\opengl32sw.dll, dist\DynamicIsland\_internal\PySide6\translations `

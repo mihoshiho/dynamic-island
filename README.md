@@ -35,12 +35,24 @@ instead.
    - a Message automation for KBank SMS
    - an Email automation for KBank alerts
    - a Share Sheet shortcut for slips, which reads the text on the phone itself
+   Or skip the slip Shortcut: tap **Import slips** in the web app and pick slips from Photos. The PC reads
+   them with Windows' built-in OCR. For Thai text and slip dates, install Windows' Thai OCR pack once, from an
+   admin PowerShell: `Add-WindowsCapability -Online -Name "Language.OCR~~~th-TH~0.0.1.0"`. Without it the
+   amount is still read, and the photo's time is used as the date.
 4. To reach the island from outside home Wi-Fi, install [Tailscale](https://tailscale.com) on both the PC and the
    iPhone. The island then shows its Tailscale address.
 
 The receiver only accepts connections from private networks and Tailscale. Every request needs the pairing key.
 Transactions are kept in `%APPDATA%\DynamicIsland\money.json`. When the same transfer arrives as an SMS, an email
 and a slip, the copies are merged into one entry.
+
+## Fonts
+
+The `fonts` folder holds the bundled fonts, all under the SIL Open Font License (see the `OFL-*.txt` files):
+
+- [Noto Sans](https://github.com/notofonts/latin-greek-cyrillic) for English and most text
+- [Noto Sans Thai](https://github.com/notofonts/thai) for Thai
+- [Kiwi Maru](https://github.com/Kiwi-KawagotoKajiru/Kiwi-Maru) for Japanese
 
 ## Run from source
 

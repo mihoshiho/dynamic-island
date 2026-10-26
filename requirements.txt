@@ -2,5 +2,8 @@ psutil==7.2.2
 PySide6-Essentials==6.12.0
 winrt-runtime==4.0.3
 winrt-Windows.Foundation==4!10.0.28000.2705
+winrt-Windows.Globalization==4!10.0.28000.2705
+winrt-Windows.Graphics.Imaging==4!10.0.28000.2705
 winrt-Windows.Media.Control==4!10.0.28000.2705
+winrt-Windows.Media.Ocr==4!10.0.28000.2705
 winrt-Windows.Storage.Streams==4!10.0.28000.2705
