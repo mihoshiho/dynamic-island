@@ -20,22 +20,31 @@ from winrt.windows.graphics.imaging import BitmapDecoder, BitmapPixelFormat, Sof
 from winrt.windows.media.ocr import OcrEngine
 from winrt.windows.storage.streams import Buffer, DataWriter, InMemoryRandomAccessStream, InputStreamOptions
 
-BG, PANEL, FG, DIM, GREEN, ORANGE, RED = '#000000', '#1c1c1e', '#ffffff', '#8e8e93', '#30d158', '#ff9f0a', '#ff453a'
-BLUE, PURPLE = '#0a84ff', '#bf5af2'
+# Sakura Fox Island theme: same names and values as the design system (see DESIGN.md). Change colours here only.
+THEME = {'ground': '#191919', 'surface': '#231f21', 'surface-2': '#2e282b', 'line': '#3d3438', 'ink': '#fff4f8',
+         'muted': '#b3a1aa', 'faint': '#7d6e75', 'sakura': '#ff9ec8', 'sakura-deep': '#f06aa6',
+         'sakura-tint': '#3a2430', 'on-sakura': '#2a1520', 'fox': '#ffa86b', 'fox-cream': '#fff4e8',
+         'fox-ink': '#2b1d14', 'mint': '#86ebc0', 'coral': '#ff7f98', 'lavender': '#c4a8ff', 'sky': '#8ccfff',
+         'butter': '#ffe29a'}
+BG, PANEL, FG, DIM, FAINT = THEME['ground'], THEME['surface-2'], THEME['ink'], THEME['muted'], THEME['faint']
+SAKURA, ON_SAKURA, LINE = THEME['sakura'], THEME['on-sakura'], THEME['line']
+GREEN, ORANGE, RED = THEME['mint'], THEME['fox'], THEME['coral']  # money in · timers and alerts · money out
+BLUE, PURPLE = THEME['sky'], THEME['lavender']  # CPU and RAM graphs
+ROUND = 'Kiwi Maru'  # the round face for big numbers: timer, money totals
 FONT = 'Noto Sans'  # Japanese falls back to Kiwi Maru, Thai to Noto Sans Thai (see load_fonts)
 FONT_DIR = pathlib.Path(getattr(sys, '_MEIPASS', pathlib.Path(__file__).parent)) / 'fonts'  # bundled in the .exe
 PREV, PLAY, PAUSE, NEXT = '\uE892', '\uE768', '\uE769', '\uE893'
 MUSIC, SYSTEM, TIMER, CALENDAR = '\uE8D6', '\uE9D9', '\uE916', '\uE787'
 PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
-COMPACT_H, TOP, WIN = 36, 8, (820, 360)
+COMPACT_H, TOP, WIN = 36, 8, (820, 400)
 GEAR, LYRICS = '', ''
 SHELF, MONEY = '', ''
 TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'timer', 'calendar', 'settings']
-SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (660, 250), 'system': (540, 220),
-         'timer': (400, 180), 'calendar': (580, 260), 'settings': (460, 330), 'alert': (400, 160)}
+SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 250), 'system': (540, 220),
+         'timer': (400, 180), 'calendar': (580, 260), 'settings': (460, 362), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.2.1'
+VERSION = '1.3.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -55,7 +64,8 @@ if FROZEN:  # a windowed .exe has no console: keep errors in a file so bugs can 
     faulthandler.enable(_log)
     threading.excepthook = lambda a: sys.excepthook(a.exc_type, a.exc_value, a.exc_traceback)
 DEFAULTS = {'tiny_fullscreen': True, 'compact_lyrics': True, 'sound': True, 'screen': 0,
-            'translation': None, 'pronunciation': None, 'auto_update': True, 'phone_sync': False, 'phone_key': None}
+            'translation': None, 'pronunciation': None, 'auto_update': True, 'phone_sync': False, 'phone_key': None,
+            'fox': True}
 TRANSLATIONS = [('Off', None), ('ไทย', 'th'), ('English', 'en'), ('日本語', 'ja')]
 PRONUNCIATIONS = [('Off', None), ('Romaji', 'romaji')]
 RUN_KEY, RUN_NAME = r'Software\Microsoft\Windows\CurrentVersion\Run', 'DynamicIsland'
@@ -261,7 +271,7 @@ def add_tx(tx, source, raw=''):
                     save_money()
                 return old
         new = {'id': secrets.token_hex(4), 'ts': tx['ts'], 'amount': round(tx['amount'], 2), 'kind': tx['kind'],
-               'note': tx.get('note', ''), 'source': source, 'raw': raw[:500]}
+               'note': tx.get('note', ''), 'cat': tx.get('cat', ''), 'source': source, 'raw': raw[:500]}
         money.append(new)
         money.sort(key=lambda x: x['ts'])
         save_money()
@@ -319,7 +329,8 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', ctype + ('; charset=utf-8' if 'json' in ctype or 'html' in ctype else ''))
         self.send_header('Content-Length', str(len(data)))
-        self.send_header('Cache-Control', 'no-store')
+        # fonts (5 MB for Kiwi Maru) and the icon never change: let the phone keep them; data is always fresh
+        self.send_header('Cache-Control', 'public, max-age=604800' if ctype in ('font/ttf', 'image/png') else 'no-store')
         self.end_headers()
         self.wfile.write(data)
 
@@ -329,11 +340,12 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         k = urllib.parse.parse_qs(url.query).get('k', [''])[0]
         if url.path == f'/app/{self.key}':
-            return self.send(200, MONEY_APP.replace('__KEY__', self.key), 'text/html')
+            theme = ';'.join(f'--{k}:{v}' for k, v in THEME.items())  # the island's colours, one source
+            return self.send(200, MONEY_APP.replace('__KEY__', self.key).replace('__THEME__', theme), 'text/html')
         if url.path == f'/manifest/{self.key}.json':
             return self.send(200, {'name': 'Island Money', 'short_name': 'Money', 'display': 'standalone',
-                                   'start_url': f'/app/{self.key}', 'background_color': '#000000',
-                                   'theme_color': '#000000', 'icons': [{'src': '/icon.png', 'sizes': '180x180',
+                                   'start_url': f'/app/{self.key}', 'background_color': BG,
+                                   'theme_color': BG, 'icons': [{'src': '/icon.png', 'sizes': '180x180',
                                                                         'type': 'image/png'}]})
         if url.path == '/icon.png':
             return self.send(200, self.icon, 'image/png')
@@ -368,6 +380,8 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
             if not tx['dated'] and q.get('ts'):  # date unreadable (English OCR drops the Thai month): photo's time
                 tx['ts'] = float(q['ts'][0]) / 1000
             tx['note'] = 'KBank slip'
+            if q.get('preview'):  # the app shows it for checking first, then saves through /api/tx
+                return self.send(200, {**tx, 'text': text[:500], 'lang': lang})
             return self.send(200, {**add_tx(tx, 'slip', text), 'lang': lang})
         try:
             body = json.loads(self.rfile.read(min(int(self.headers.get('Content-Length', 0)), 65536)) or b'{}')
@@ -380,9 +394,10 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
             source = str(body.get('source') or 'manual')[:12]
             if body.get('amount') not in (None, ''):  # typed in the app
                 try:
-                    tx = {'ts': time.time(), 'amount': abs(float(body['amount'])),
-                          'kind': 'in' if body.get('kind') == 'in' else 'out', 'note': str(body.get('note', ''))[:80]}
-                except ValueError:
+                    tx = {'ts': float(body.get('ts') or time.time()), 'amount': abs(float(body['amount'])),
+                          'kind': 'in' if body.get('kind') == 'in' else 'out', 'note': str(body.get('note', ''))[:80],
+                          'cat': str(body.get('cat', ''))[:20]}
+                except (TypeError, ValueError):
                     return self.send(400, {'error': 'bad amount'})
             else:  # bank text from a Shortcut
                 text = str(body.get('text', ''))
@@ -392,6 +407,12 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                 tx['note'] = 'KBank'
             return self.send(200, add_tx(tx, source, str(body.get('text', ''))))
         if path == '/api/edit':
+            for field in ('ts', 'amount'):  # check before changing anything
+                if field in body:
+                    try:
+                        body[field] = abs(float(body[field]))
+                    except (TypeError, ValueError):
+                        return self.send(400, {'error': f'bad {field}'})
             with money_lock:
                 t = next((t for t in money if t['id'] == body.get('id')), None)
                 if not t:
@@ -403,6 +424,13 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                         t['kind'] = body['kind']
                     if 'note' in body:
                         t['note'] = str(body['note'])[:80]
+                    if 'cat' in body:
+                        t['cat'] = str(body['cat'])[:20]
+                    if body.get('amount'):
+                        t['amount'] = round(body['amount'], 2)
+                    if 'ts' in body:  # when it was really received / spent
+                        t['ts'] = body['ts']
+                        money.sort(key=lambda x: x['ts'])
                 save_money()
             return self.send(200, {'ok': True})
         self.send(404, {'error': 'not found'})
@@ -420,36 +448,67 @@ MONEY_APP = '''<!doctype html><html lang="en"><head><meta charset="utf-8">
 @font-face{font-family:'Noto Sans Thai';font-weight:600 700;src:url(/fonts/NotoSansThai-Bold.ttf)}
 @font-face{font-family:'Kiwi Maru';font-weight:400;src:url(/fonts/KiwiMaru-Regular.ttf);unicode-range:U+3000-30FF,U+4E00-9FFF,U+FF00-FFEF}
 @font-face{font-family:'Kiwi Maru';font-weight:500 700;src:url(/fonts/KiwiMaru-Medium.ttf);unicode-range:U+3000-30FF,U+4E00-9FFF,U+FF00-FFEF}
-:root{--bg:#000;--card:#1c1c1e;--line:#2c2c2e;--fg:#fff;--dim:#8e8e93;--in:#30d158;--out:#ff453a;--blue:#0a84ff}
+@font-face{font-family:'Kiwi Round';font-weight:500;src:url(/fonts/KiwiMaru-Medium.ttf)}
+:root{__THEME__;--round:'Kiwi Round','Noto Sans',sans-serif}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px 'Noto Sans','Kiwi Maru','Noto Sans Thai',-apple-system,sans-serif;
- padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 24px)}
-h1{font-size:28px;margin:18px 0 12px}h2{font-size:13px;color:var(--dim);font-weight:600;text-transform:uppercase;margin:22px 4px 8px}
-.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px}.card{background:var(--card);border-radius:14px;padding:14px}
-.card small{color:var(--dim);font-size:13px}.in{color:var(--in)}.out{color:var(--out)}.big{font-size:20px;font-weight:700;margin-top:4px}
-.list{background:var(--card);border-radius:14px;overflow:hidden}
+body{margin:0;background:var(--ground);color:var(--ink);font:16px 'Noto Sans','Kiwi Maru','Noto Sans Thai',-apple-system,sans-serif;
+ padding:env(safe-area-inset-top) max(16px,env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + 24px) max(16px,env(safe-area-inset-left))}
+h1{font:500 28px var(--round);margin:18px 0 12px;display:flex;align-items:center;gap:8px}
+h2{font-size:12px;color:var(--muted);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin:22px 4px 8px}
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px}.card{background:var(--surface);border-radius:14px;padding:14px}
+.card small{color:var(--muted);font-size:13px}.in{color:var(--mint)}.out{color:var(--coral)}
+.big{font:500 20px var(--round);margin-top:4px;font-variant-numeric:tabular-nums}
+.list{background:var(--surface);border-radius:14px;overflow:hidden}
 .tx{display:flex;align-items:center;gap:10px;padding:12px 14px;border-top:1px solid var(--line)}.tx:first-child{border-top:0}
-.tx .w{flex:1;min-width:0}.tx .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tx .s{color:var(--dim);font-size:12px}
-.tx .a{font-weight:600;font-variant-numeric:tabular-nums}
-button{font:inherit;border:0;border-radius:10px;padding:10px 14px;background:var(--line);color:var(--fg)}
-.icon{padding:6px 9px;font-size:14px;background:transparent;color:var(--dim)}
+.tx .w{flex:1;min-width:0}.tx .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tx .s{color:var(--muted);font-size:12px}
+.tx .a{font-weight:700;font-variant-numeric:tabular-nums}
+button{font:inherit;border:0;border-radius:10px;padding:10px 14px;background:var(--surface-2);color:var(--ink)}
+button:focus-visible,input:focus-visible{outline:none;box-shadow:0 0 0 3px #ff9ec866}
+.primary{background:var(--sakura);color:var(--on-sakura);font-weight:700}.primary:active{background:var(--sakura-deep)}
 form{display:grid;grid-template-columns:1fr auto;gap:8px}
-input{font:inherit;width:100%;padding:12px;border-radius:10px;border:0;background:var(--card);color:var(--fg)}
-.seg{display:flex;gap:6px}.seg button.on{background:var(--blue)}.full{grid-column:1/-1}
-.steps{background:var(--card);border-radius:14px;padding:6px 16px;color:#d1d1d6;font-size:14px;line-height:1.5}
-code{background:#000;padding:2px 6px;border-radius:6px;word-break:break-all;font-size:13px}
-.empty{color:var(--dim);padding:18px 14px;text-align:center}</style></head><body>
-<h1>Money</h1>
+input{font:inherit;width:100%;padding:12px;border-radius:10px;border:0;background:var(--surface-2);color:var(--ink)}
+input::placeholder{color:var(--faint)}
+.seg{display:flex;gap:6px}.seg button.on{background:var(--sakura);color:var(--on-sakura);font-weight:700}.full{grid-column:1/-1}
+.steps{background:var(--surface);border-radius:14px;padding:6px 16px;color:var(--muted);font-size:14px;line-height:1.5}
+.steps b{color:var(--ink)}
+code{background:var(--ground);color:var(--sakura);padding:2px 6px;border-radius:6px;word-break:break-all;font-size:13px}
+.empty{color:var(--muted);padding:18px 14px;text-align:center}
+.chips{display:flex;flex-wrap:wrap;gap:6px}.chip{padding:7px 13px;border-radius:999px;font-size:14px}
+.chip.on{background:var(--sakura);color:var(--on-sakura);font-weight:700}
+.day{font-size:13px;color:var(--muted);font-weight:700;margin:16px 4px 6px;display:flex;justify-content:space-between}
+.tx .e{font-size:22px;width:30px;text-align:center}
+.sheet{position:fixed;inset:0;background:#19191999;display:none;align-items:flex-end;z-index:9}.sheet.on{display:flex}
+.panel{background:var(--surface);width:100%;border-radius:20px 20px 0 0;padding:18px 16px calc(env(safe-area-inset-bottom) + 18px);
+ display:grid;gap:12px}.panel input{background:var(--ground)}.panel .big{text-align:center;font-size:30px}
+.danger{color:var(--coral)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}label{font-size:13px;color:var(--muted)}
+.petal{width:22px;height:22px;flex:none}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}</style></head><body>
+<h1><svg class="petal" viewBox="-12 -12 24 24" aria-hidden="true"><g style="fill:var(--sakura)">
+<ellipse rx="4" ry="7" cy="-5"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(72)"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(144)"/>
+<ellipse rx="4" ry="7" cy="-5" transform="rotate(216)"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(288)"/></g>
+<circle r="2.5" style="fill:var(--butter)"/></svg>Money</h1>
 <div class="cards"><div class="card"><small>Today</small><div class="big in" id="ti"></div><div class="big out" id="to"></div></div>
 <div class="card"><small>This month</small><div class="big in" id="mi"></div><div class="big out" id="mo"></div></div></div>
 <h2>Add</h2>
 <form id="f"><input id="amt" inputmode="decimal" placeholder="Amount ฿" required>
 <div class="seg"><button type="button" id="bo" class="on">Out</button><button type="button" id="bi">In</button></div>
-<input id="note" class="full" placeholder="Note (food, salary…)"><button class="full" style="background:var(--blue)">Add</button></form>
+<div class="chips full" id="cats"></div>
+<input id="note" class="full" placeholder="Note (optional)"><button class="full primary">Add</button></form>
 <h2>Import slips</h2>
 <button id="pick" style="width:100%">Choose K PLUS slips from Photos</button>
-<input id="files" type="file" accept="image/*" multiple hidden><p class="s" id="st" style="color:var(--dim);margin:8px 4px"></p>
-<h2>History</h2><div class="list" id="list"></div>
+<input id="files" type="file" accept="image/*" multiple hidden><p class="s" id="st" style="color:var(--muted);margin:8px 4px"></p>
+<h2>History</h2><div id="list"></div>
+<div class="sheet" id="sheet"><div class="panel">
+<div class="s" id="e_title" style="text-align:center;color:var(--muted);font-size:13px"></div>
+<input class="big" id="e_amt" inputmode="decimal" placeholder="0.00">
+<div class="seg" style="justify-content:center"><button type="button" id="e_out">Out</button><button type="button" id="e_in">In</button></div>
+<div class="chips" id="e_cats"></div>
+<input id="e_note" placeholder="Note">
+<label>When it was received or spent<input id="e_when" type="datetime-local"></label>
+<div class="s" id="e_src" style="color:var(--muted);font-size:12px"></div>
+<div class="row2"><button id="e_del" class="danger">Delete</button><button id="e_save" class="primary">Save</button></div>
+<button id="e_close">Cancel</button></div></div>
 <h2>iPhone Shortcuts setup</h2><div class="steps">
 <p>Each Shortcut ends with <b>Get Contents of URL</b>: URL <code id="ep"></code>, Method <b>POST</b>,
 Request Body <b>JSON</b> with <code>key</code> = <code>__KEY__</code>, <code>source</code> (below) and
@@ -464,47 +523,87 @@ Extract Text from Image → Get Contents of URL with <code>source</code> = <code
 Extracted Text. Sending a slip twice is harmless: copies are merged.</p>
 <p>Away from home Wi-Fi? Install Tailscale on the PC and the iPhone and use the island's Tailscale address.</p></div>
 <script>
-const K='__KEY__',$=id=>document.getElementById(id);let kind='out';
+const K='__KEY__',$=id=>document.getElementById(id);let kind='out',cat='';
+const CATS={out:['🍜 Food','🚆 Transport','🛍️ Shopping','💡 Bills','🎮 Fun','💊 Health','↔️ Transfer','📦 Other'],
+ in:['💼 Salary','🎁 Gift','↩️ Refund','↔️ Transfer','🏷️ Sale','📦 Other']};
 const baht=n=>n.toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2})+' ฿';
+const hhmm=d=>d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+const local=ts=>{const d=new Date(ts*1000);return new Date(d-d.getTimezoneOffset()*6e4).toISOString().slice(0,16)};
 $('ep').textContent=location.origin+'/api/tx';
-$('bo').onclick=()=>{kind='out';$('bo').className='on';$('bi').className=''};
-$('bi').onclick=()=>{kind='in';$('bi').className='on';$('bo').className=''};
+function chips(el,k,sel,pick){  // one tap picks a category, a second tap on it clears it
+ el.innerHTML='';for(const c of CATS[k]){const b=document.createElement('button');b.type='button';
+  b.className='chip'+(c==sel?' on':'');b.textContent=c;b.onclick=()=>pick(c==sel?'':c);el.appendChild(b)}}
+function setKind(k){kind=k;cat='';$('bo').className=k=='out'?'on':'';$('bi').className=k=='in'?'on':'';drawCats()}
+function drawCats(){chips($('cats'),kind,cat,c=>{cat=c;drawCats()})}
+$('bo').onclick=()=>setKind('out');$('bi').onclick=()=>setKind('in');drawCats();
 const post=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,...b})});
+function dayName(d){const t=new Date();t.setHours(0,0,0,0);const x=new Date(d);x.setHours(0,0,0,0);const n=(t-x)/864e5;
+ return n==0?'Today':n==1?'Yesterday':d.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric'})}
 async function load(){
+ if($('sheet').classList.contains('on'))return;  // don't redraw under an open edit sheet
  const d=await (await fetch('/api/tx?k='+K)).json(),t=d.totals;
  $('ti').textContent='+'+baht(t.today_in);$('to').textContent='−'+baht(t.today_out);
  $('mi').textContent='+'+baht(t.month_in);$('mo').textContent='−'+baht(t.month_out);
  const L=$('list');L.innerHTML='';
- if(!d.tx.length){L.innerHTML='<div class="empty">Nothing yet</div>';return}
+ if(!d.tx.length){L.innerHTML='<div class="list"><div class="empty">Nothing yet</div></div>';return}
+ let box=null,day='',sum=0,sumEl=null;
  for(const x of d.tx.slice().reverse()){
-  const r=document.createElement('div');r.className='tx';const when=new Date(x.ts*1000);
-  r.innerHTML=`<div class="w"><div class="n"></div><div class="s"></div></div><div class="a ${x.kind}"></div>
-   <button class="icon" title="Switch in/out">⇄</button><button class="icon" title="Delete">✕</button>`;
-  r.querySelector('.n').textContent=x.note||x.source;
-  r.querySelector('.s').textContent=when.toLocaleString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})+' · '+x.source;
+  const when=new Date(x.ts*1000),name=dayName(when);
+  if(name!=day){day=name;sum=0;const h=document.createElement('div');h.className='day';
+   h.innerHTML='<span></span><span></span>';h.firstChild.textContent=name;sumEl=h.lastChild;L.appendChild(h);
+   box=document.createElement('div');box.className='list';L.appendChild(box)}
+  sum+=x.kind=='in'?x.amount:-x.amount;sumEl.textContent=(sum<0?'−':'+')+baht(Math.abs(sum));
+  const r=document.createElement('div');r.className='tx';
+  r.innerHTML='<div class="e"></div><div class="w"><div class="n"></div><div class="s"></div></div><div class="a '+x.kind+'"></div>';
+  const [emoji,...label]=(x.cat||'').split(' ');
+  r.querySelector('.e').textContent=x.cat?emoji:(x.kind=='in'?'⬇️':'⬆️');
+  r.querySelector('.n').textContent=x.note||label.join(' ')||x.source;
+  r.querySelector('.s').textContent=[hhmm(when),x.note&&x.cat?label.join(' '):'',x.source].filter(Boolean).join(' · ');
   r.querySelector('.a').textContent=(x.kind=='in'?'+':'−')+baht(x.amount);
-  const [flip,del]=r.querySelectorAll('button');
-  flip.onclick=async()=>{await post('/api/edit',{id:x.id,kind:x.kind=='in'?'out':'in'});load()};
-  del.onclick=async()=>{if(confirm('Delete this entry?')){await post('/api/edit',{id:x.id,delete:true});load()}};
-  r.querySelector('.n').onclick=async()=>{const n=prompt('Note',x.note);if(n!==null){await post('/api/edit',{id:x.id,note:n});load()}};
-  L.appendChild(r)}}
+  r.onclick=()=>edit(x);box.appendChild(r)}}
+// one sheet for both: editing a saved entry (cur.id set) and checking a new slip before it is saved (no id)
+let cur=null,answer=null;
+function edit(x,title){cur={...x};$('e_amt').value=x.amount?x.amount.toFixed(2):'';$('e_note').value=x.note||'';
+ $('e_when').value=local(x.ts);$('e_title').textContent=title||'';
+ $('e_src').textContent=title?'Check what the slip says, fix anything wrong, then Save':
+  'From '+x.source+(x.source.includes('slip')?' · time read from the slip':'');
+ $('e_del').textContent=cur.id?'Delete':'Skip';drawEdit();$('sheet').classList.add('on');
+ return new Promise(r=>answer=r)}
+function drawEdit(){$('e_amt').className='big '+cur.kind;$('e_out').className=cur.kind=='out'?'on':'';$('e_in').className=cur.kind=='in'?'on':'';
+ chips($('e_cats'),cur.kind,cur.cat,c=>{cur.cat=c;drawEdit()})}
+$('e_out').onclick=()=>{if(cur.kind!='out'){cur.kind='out';cur.cat=''}drawEdit()};
+$('e_in').onclick=()=>{if(cur.kind!='in'){cur.kind='in';cur.cat=''}drawEdit()};
+const close=r=>{$('sheet').classList.remove('on');if(answer){answer(r);answer=null}load()};
+$('e_close').onclick=()=>close('cancel');$('sheet').onclick=e=>{if(e.target.id=='sheet')close('cancel')};
+$('e_save').onclick=async()=>{
+ const ts=new Date($('e_when').value).getTime()/1000,amount=parseFloat($('e_amt').value.replace(/,/g,''));
+ if(!(amount>0)){$('e_amt').focus();return}
+ const f={kind:cur.kind,cat:cur.cat||'',note:$('e_note').value,amount,...(isNaN(ts)?{}:{ts})};
+ if(cur.id)await post('/api/edit',{id:cur.id,...f});else await post('/api/tx',{...f,source:'slip',text:cur.text||''});
+ close('saved')};
+$('e_del').onclick=async()=>{if(!cur.id)return close('skipped');
+ if(confirm('Delete this entry?')){await post('/api/edit',{id:cur.id,delete:true});close('deleted')}};
 async function shrink(f){  // phone photos are huge: send at most 2000 px, as JPEG (also turns HEIC into JPEG)
  const b=await createImageBitmap(f),s=Math.min(1,2000/Math.max(b.width,b.height)),c=document.createElement('canvas');
  c.width=Math.round(b.width*s);c.height=Math.round(b.height*s);c.getContext('2d').drawImage(b,0,0,c.width,c.height);
  return new Promise(r=>c.toBlob(r,'image/jpeg',0.9))}
 $('pick').onclick=()=>$('files').click();
-$('files').onchange=async()=>{
- const fs=[...$('files').files];let ok=0,bad=0,noThai=false;
+$('files').onchange=async()=>{  // read each slip, show it for checking, save only what you confirm
+ const fs=[...$('files').files];let ok=0,skip=0,noThai=false;
  for(const [i,f] of fs.entries()){
   $('st').textContent=`Reading slip ${i+1} of ${fs.length}…`;
-  try{const r=await fetch(`/api/slip?k=${K}&ts=${f.lastModified}`,{method:'POST',headers:{'Content-Type':'image/jpeg'},body:await shrink(f)});
-   const d=await r.json();if(r.ok)ok++;else bad++;if(d.lang&&d.lang!='th')noThai=true}catch(e){bad++}}
- $('st').textContent=`${ok} slip${ok==1?'':'s'} added`+(bad?`, ${bad} not readable`:'')+
+  let d={amount:0,kind:'out',ts:f.lastModified/1000,note:'KBank slip',cat:'',source:'slip'},title=`Slip ${i+1} of ${fs.length}`;
+  try{const r=await fetch(`/api/slip?k=${K}&preview=1&ts=${f.lastModified}`,{method:'POST',
+    headers:{'Content-Type':'image/jpeg'},body:await shrink(f)});
+   const res=await r.json();if(res.lang&&res.lang!='th')noThai=true;
+   if(r.ok)d={...d,...res};else title+=' · could not read it, type it in'}catch(e){title+=' · could not read it, type it in'}
+  const a=await edit(d,title);if(a=='saved')ok++;else skip++;if(a=='cancel')break}
+ $('st').textContent=`${ok} slip${ok==1?'':'s'} saved`+(skip?`, ${skip} skipped`:'')+
   (noThai?' · Thai OCR is not installed on the PC, so dates come from the photo':'');
  $('files').value='';load()};
 $('f').onsubmit=async e=>{e.preventDefault();
- await post('/api/tx',{amount:$('amt').value.replace(/,/g,''),kind,note:$('note').value,source:'manual'});
- $('amt').value='';$('note').value='';load()};
+ await post('/api/tx',{amount:$('amt').value.replace(/,/g,''),kind,cat,note:$('note').value,source:'manual'});
+ $('amt').value='';$('note').value='';cat='';drawCats();load()};
 load();setInterval(load,5000);
 </script></body></html>'''
 
@@ -543,12 +642,12 @@ def icon_png(size=180):
     p.setRenderHint(QPainter.Antialiasing)
     p.setPen(Qt.NoPen)
     s = size / 256
-    p.setBrush(QColor('#1c1c1e'))
+    p.setBrush(QColor(THEME['surface']))
     p.drawRoundedRect(QRectF(8 * s, 78 * s, 240 * s, 100 * s), 50 * s, 50 * s)
-    p.setBrush(QColor(GREEN))
+    p.setBrush(QColor(SAKURA))
     for x, h in ((150, 40), (170, 64), (190, 30), (210, 52)):
         p.drawRoundedRect(QRectF(x * s, (128 - h / 2) * s, 11 * s, h * s), 5.5 * s, 5.5 * s)
-    p.setBrush(QColor(FG))
+    p.setBrush(QColor(THEME['fox']))
     p.drawEllipse(QRectF(40 * s, 106 * s, 44 * s, 44 * s))
     p.end()
     buf = QBuffer()
@@ -897,10 +996,11 @@ def tint(pix):  # art's average color, kept bright, like the macOS island's wave
 
 
 class Text(QWidget):  # one elided line; a QLabel would widen the island on long titles
-    def __init__(self, size=10, color=FG, bold=False, align=Qt.AlignLeft):
+    def __init__(self, size=10, color=FG, bold=False, align=Qt.AlignLeft, family=FONT):
         super().__init__()
-        self.setFont(QFont(FONT, size, QFont.Bold if bold else QFont.Normal))
+        self.setFont(QFont(family, size, QFont.Bold if bold else QFont.Normal))
         self.color, self.align, self.text = QColor(color), align, ''
+        self.backdrop = False  # paint the pill's black behind the text, so things can pass behind it
         self.setFixedHeight(self.fontMetrics().height() + 2)
 
     def set(self, text, color=None):
@@ -910,9 +1010,12 @@ class Text(QWidget):  # one elided line; a QLabel would widen the island on long
 
     def paintEvent(self, e):
         p = QPainter(self)
+        text = self.fontMetrics().elidedText(self.text, Qt.ElideRight, self.width())
+        if self.backdrop and text:
+            box = p.boundingRect(self.rect(), self.align | Qt.AlignVCenter, text).adjusted(-6, -4, 6, 4)
+            p.fillRect(box, QColor(BG))
         p.setPen(self.color)
-        p.drawText(self.rect(), self.align | Qt.AlignVCenter,
-                   self.fontMetrics().elidedText(self.text, Qt.ElideRight, self.width()))
+        p.drawText(self.rect(), self.align | Qt.AlignVCenter, text)
 
 
 class Art(QWidget):
@@ -936,14 +1039,14 @@ class Art(QWidget):
             s = min(w, h)
             p.drawPixmap(QRectF(self.rect()), self.pix, QRectF((w - s) / 2, (h - s) / 2, s, s))
         else:
-            p.fillPath(path, QColor('#2c2c2e'))
+            p.fillPath(path, QColor(THEME['sakura-tint']))
 
 
 class Wave(QWidget):  # decorative equalizer bars
     def __init__(self, w, h):
         super().__init__()
         self.setFixedSize(w, h)
-        self.levels, self.on, self.color = [0.25] * 4, False, QColor(GREEN)
+        self.levels, self.on, self.color = [0.25] * 4, False, QColor(SAKURA)
         self.timer = QTimer(self, timeout=self.step, interval=130)
 
     def set_on(self, on):
@@ -1243,6 +1346,67 @@ class ShelfList(QListWidget):
             self.dragging = False
 
 
+FOX_BODY = ['           o o  ',  # 16 x 8 pixel fox facing right: o orange, w white, d dark
+            '          ooooo ',
+            ' ww       oodooo',
+            'wooo  oooooooowd',
+            ' ooooooooooooww ',
+            '   oooooooooo   ']
+FOX_LEGS = (['    o o   o o   ', '    d d   d d   '],  # standing / stride 1
+            ['   o   o o   o  ', '  d     d d   d '])  # stride 2
+FOX_COLORS = {'o': THEME['fox'], 'w': THEME['fox-cream'], 'd': THEME['fox-ink']}
+
+
+class Fox(QWidget):
+    """Idle buddy: runs back and forth in the closed pill when nothing plays, rests a moment at each end."""
+    PX = 2  # screen pixels per fox pixel
+
+    def __init__(self, island):
+        super().__init__(island)
+        self.island = island
+        self.setFixedSize(16 * self.PX, 8 * self.PX)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)  # hovering the fox still opens the island
+        self.x, self.dir, self.frame, self.rest_until = 0.0, 1, 0, 0.0
+        self.timer = QTimer(self, timeout=self.step, interval=90)
+
+    def set_active(self, on):
+        if on and not self.timer.isActive():
+            r = self.island.shape
+            self.x = r.left() + 12
+            self.timer.start()
+            self.show()
+            self.step()
+        elif not on and self.timer.isActive():
+            self.timer.stop()
+            self.hide()
+
+    def step(self):
+        r, now = self.island.shape, time.time()
+        lo, hi = r.left() + 12, r.right() - 12 - self.width()
+        if now < self.rest_until:
+            self.frame = 0
+        else:
+            self.x += self.dir * 2.2
+            self.frame ^= 1
+            if not lo <= self.x <= hi or random.random() < 0.004:  # an end, or now and then a breather
+                self.x = min(max(self.x, lo), hi)
+                if self.x in (lo, hi):
+                    self.dir = 1 if self.x == lo else -1
+                self.rest_until, self.frame = now + random.uniform(1.2, 3.5), 0
+        self.move(int(self.x), int(r.center().y() - self.height() / 2 + 2))
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        if self.dir < 0:  # running left: mirror
+            p.translate(self.width(), 0)
+            p.scale(-1, 1)
+        for y, line in enumerate(FOX_BODY + FOX_LEGS[self.frame]):
+            for x, ch in enumerate(line):
+                if ch != ' ':
+                    p.fillRect(x * self.PX, y * self.PX, self.PX, self.PX, QColor(FOX_COLORS[ch]))
+
+
 class Switch(QAbstractButton):  # macOS-style toggle
     def __init__(self, on, cb):
         super().__init__(checkable=True, checked=on)
@@ -1255,7 +1419,7 @@ class Switch(QAbstractButton):  # macOS-style toggle
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(GREEN if self.isChecked() else '#3a3a3c'))
+        p.setBrush(QColor(SAKURA if self.isChecked() else LINE))
         p.drawRoundedRect(QRectF(self.rect()), 11, 11)
         p.setBrush(QColor(FG))
         p.drawEllipse(QRectF(18 if self.isChecked() else 2, 2, 18, 18))
@@ -1276,7 +1440,7 @@ def icon_button(glyph, size, cb):
 
 
 ICON_STYLE = 'QPushButton{{color:{color};background:transparent;border:none;padding:4px 10px}}' \
-             'QPushButton:hover{{color:#bbb}}'
+             'QPushButton:hover{{color:' + SAKURA + '}}'
 
 
 def pill_button(text, cb):
@@ -1313,26 +1477,30 @@ def column(*items, spacing=2):
 
 
 STYLE = f'''
-QLineEdit, QTimeEdit {{ background:{PANEL}; color:white; border:none; border-radius:8px; padding:4px 8px;
-                       font:10pt "{FONT}"; }}
+QLineEdit, QTimeEdit {{ background:{PANEL}; color:{FG}; border:none; border-radius:10px; padding:4px 8px;
+                       font:10pt "{FONT}"; selection-background-color:{SAKURA}; selection-color:{ON_SAKURA}; }}
 QTimeEdit::up-button, QTimeEdit::down-button {{ width:0; }}
-QPushButton#pill {{ background:{PANEL}; color:white; border:none; border-radius:10px; padding:4px 12px; font:9pt "{FONT}"; }}
-QPushButton#pill:hover {{ background:#3a3a3c; }}
-QMenu {{ background:{PANEL}; color:white; border:none; }}
-QListWidget {{ background:{PANEL}; color:white; border:none; border-radius:8px; padding:2px; font:9pt "{FONT}";
+QPushButton#pill {{ background:{PANEL}; color:{FG}; border:none; border-radius:12px; padding:4px 12px; font:9pt "{FONT}"; }}
+QPushButton#pill:hover {{ background:{LINE}; }}
+QPushButton#pill:pressed {{ background:{SAKURA}; color:{ON_SAKURA}; }}
+QMenu {{ background:{PANEL}; color:{FG}; border:none; }}
+QMenu::item:selected {{ background:{SAKURA}; color:{ON_SAKURA}; }}
+QListWidget {{ background:{THEME['surface']}; color:{FG}; border:none; border-radius:14px; padding:2px; font:9pt "{FONT}";
                outline:0; }}
-QListWidget::item:selected {{ background:{BLUE}; border-radius:4px; }}
-QCalendarWidget QWidget {{ background:{BG}; color:white; alternate-background-color:{BG}; }}
-QCalendarWidget QAbstractItemView {{ selection-background-color:{BLUE}; selection-color:white; font:9pt "{FONT}";
-                                     outline:0; }}
-QCalendarWidget QAbstractItemView:disabled {{ color:#48484a; }}
-QCalendarWidget QToolButton {{ color:white; background:transparent; border:none; font:bold 10pt "{FONT}"; padding:2px 6px; }}
-QCalendarWidget QToolButton:hover {{ background:{PANEL}; border-radius:6px; }}
+QListWidget::item:selected {{ background:{THEME['sakura-tint']}; border-radius:8px; }}
+QCalendarWidget QWidget {{ background:{BG}; color:{FG}; alternate-background-color:{BG}; }}
+QCalendarWidget QAbstractItemView {{ selection-background-color:{SAKURA}; selection-color:{ON_SAKURA};
+                                     font:9pt "{FONT}"; outline:0; }}
+QCalendarWidget QAbstractItemView:disabled {{ color:{FAINT}; }}
+QCalendarWidget QToolButton {{ color:{FG}; background:transparent; border:none; font:bold 10pt "{FONT}"; padding:2px 6px; }}
+QCalendarWidget QToolButton:hover {{ background:{PANEL}; border-radius:10px; }}
 QCalendarWidget QToolButton::menu-indicator {{ image:none; }}
-QCalendarWidget QSpinBox {{ background:{PANEL}; color:white; border:none; }}
-QComboBox {{ background:{PANEL}; color:white; border:none; border-radius:8px; padding:3px 10px; font:9pt "{FONT}"; }}
+QCalendarWidget QSpinBox {{ background:{PANEL}; color:{FG}; border:none; }}
+QComboBox {{ background:{PANEL}; color:{FG}; border:none; border-radius:10px; padding:3px 10px; font:9pt "{FONT}"; }}
 QComboBox::drop-down {{ border:none; width:0; }}
-QComboBox QAbstractItemView {{ background:{PANEL}; color:white; selection-background-color:{BLUE}; border:none; }}
+QComboBox QAbstractItemView {{ background:{PANEL}; color:{FG}; selection-background-color:{SAKURA};
+                               selection-color:{ON_SAKURA}; border:none; }}
+QToolTip {{ background:{PANEL}; color:{FG}; border:none; }}
 '''
 
 
@@ -1398,7 +1566,10 @@ class Island(QWidget):
         self.c_timer.setFixedWidth(46)
         self.compact = row(self.c_art, self.c_text, self.c_wave, self.c_timer, spacing=8)
         self.compact.setParent(self)
-        self.compact.layout().setContentsMargins(7, 6, 14, 6)
+        self.compact.layout().setContentsMargins(8, 6, 10, 6)  # near-even sides keep the clock centered
+        self.fox = Fox(self)
+        self.fox.stackUnder(self.compact)  # the clock stays readable when the fox runs past it
+        self.fox.hide()
         self.compact.layout().setStretch(1, 1)
 
         # expanded header: date left, tabs right
@@ -1411,7 +1582,7 @@ class Island(QWidget):
         self.f_art = Art(64, 14)
         self.f_title = Text(12, bold=True)
         self.f_artist = Text(10, DIM)
-        self.f_lyric = Text(11, GREEN)
+        self.f_lyric = Text(11, SAKURA)
         self.f_wave = Wave(26, 20)
         self.f_pos, self.f_left = Text(8, DIM), Text(8, DIM, align=Qt.AlignRight)
         self.f_pos.setFixedWidth(40)
@@ -1455,14 +1626,13 @@ class Island(QWidget):
         self.save_shelf()  # writes back without missing files, sets the hint
 
         # money page: today / month totals, latest entries, phone link
-        self.m_totals = [Text(14, GREEN, bold=True), Text(14, RED, bold=True),
-                         Text(14, GREEN, bold=True), Text(14, RED, bold=True)]
+        self.m_totals = [Text(14, c, bold=True, family=ROUND) for c in (GREEN, RED, GREEN, RED)]
         heads = []
         for label in ('TODAY', 'THIS MONTH'):
             heads.append(Text(8, DIM))
             heads[-1].set(label)
         for w in self.m_totals + heads:  # Text has no natural width; without this the list squeezes them to 0
-            w.setFixedWidth(118)
+            w.setFixedWidth(150)  # round Kiwi Maru digits run wide: "+25,500.00 ฿" must fit
         self.m_rows = [(Text(9, DIM), Text(9), Text(10, bold=True, align=Qt.AlignRight)) for _ in range(4)]
         for when, _, amount in self.m_rows:
             when.setFixedWidth(72)
@@ -1494,7 +1664,7 @@ class Island(QWidget):
             system_page.layout().setStretch(i, 1)
 
         # timer page: big countdown, presets
-        self.t_big = Text(30, ORANGE, bold=True, align=Qt.AlignCenter)
+        self.t_big = Text(30, ORANGE, bold=True, align=Qt.AlignCenter, family=ROUND)
         self.e_timer = QLineEdit('5')
         self.e_timer.setFixedWidth(44)
         self.e_timer.returnPressed.connect(self.toggle_timer)
@@ -1558,6 +1728,7 @@ class Island(QWidget):
             setting('Start with Windows', Switch(autostart(), autostart)),
             setting('Tiny island in fullscreen apps and games', toggle('tiny_fullscreen')),
             setting('Lyrics in small island', toggle('compact_lyrics')),
+            setting('Fox runs in the island when idle', toggle('fox')),
             setting('Lyrics translation', choice('translation', TRANSLATIONS)),
             setting('Lyrics pronunciation', choice('pronunciation', PRONUNCIATIONS)),
             setting('Alert sound', toggle('sound')),
@@ -1636,7 +1807,7 @@ class Island(QWidget):
             latest = money[-4:][::-1]
         for (when, note, amount), tx in zip(self.m_rows, latest + [None] * 4):
             when.set(time.strftime('%d %b %H:%M', time.localtime(tx['ts'])) if tx else '')
-            note.set((tx['note'] or tx['source']) if tx else '')
+            note.set(' · '.join(filter(None, (tx.get('cat'), tx['note']))) or tx['source'] if tx else '')
             amount.set(f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} ฿' if tx else '',
                        (GREEN if tx['kind'] == 'in' else RED) if tx else None)
 
@@ -1658,7 +1829,8 @@ class Island(QWidget):
             w, h = TINY
             return QRectF((self.width() - w) / 2, 2, w, h)
         else:
-            w, h = (320 if self.alert or self.flash or media.get('playing') or self.timer_end else 150), COMPACT_H
+            busy = self.alert or self.flash or media.get('playing') or self.timer_end
+            w, h = (320 if busy else 190 if self.settings['fox'] else 150), COMPACT_H  # idle: room for the fox
         return QRectF((self.width() - w) / 2, TOP, w, h)
 
     def morph(self):
@@ -1696,7 +1868,7 @@ class Island(QWidget):
         r = min(self.shape.height() / 2, 34)
         p.drawRoundedRect(self.shape, r, r)
         if self.drop_hover:  # files are being dragged over: outline says "drop here"
-            p.setPen(QPen(QColor(GREEN), 2))
+            p.setPen(QPen(QColor(SAKURA), 2))
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(self.shape.adjusted(1, 1, -1, -1), r - 1, r - 1)
 
@@ -1874,7 +2046,7 @@ class Island(QWidget):
             if media.get('art'):
                 pix.loadFromData(media['art'])
             pix = None if pix.isNull() else pix
-            color = tint(pix) if pix else QColor(GREEN)
+            color = tint(pix) if pix else QColor(SAKURA)
             for w in (self.c_art, self.f_art):
                 w.set(pix)
             self.c_wave.color = self.f_wave.color = self.lyrics.color = color
@@ -1885,7 +2057,10 @@ class Island(QWidget):
         timer = mmss(left) if left is not None else ''
 
         # compact
-        self.c_art.setVisible(bool(title) and not self.alert)
+        self.c_art.setVisible(playing and not self.alert and not self.flash)  # paused: clock alone, centered
+        self.fox.set_active(self.settings['fox'] and not (self.expanded or self.tiny or self.alert or self.flash
+                                                           or playing or timer or self.anim.state() == QVariantAnimation.Running))
+        self.c_text.backdrop = self.fox.isVisible()  # the fox runs behind the clock, like through a tunnel
         self.c_wave.set_on(playing)
         self.f_wave.set_on(playing)
         self.c_wave.setVisible(playing and not timer)
@@ -1943,7 +2118,7 @@ class Island(QWidget):
         if page != self.pages.currentWidget().objectName():
             self.pages.setCurrentWidget(self.pages.findChild(QWidget, page))
             for b, t in zip(self.tab_buttons, TABS):
-                b.setStyleSheet(ICON_STYLE.format(color=FG if t == page else '#636366'))
+                b.setStyleSheet(ICON_STYLE.format(color=FG if t == page else FAINT))
         self.a_text.set(self.alert or '')
         self.morph()
 
