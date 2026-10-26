@@ -1,4 +1,4 @@
-"""Dynamic Island for Windows, macOS style. Tabs: music (album art, synced lyrics, controls),
+﻿"""Dynamic Island for Windows, macOS style. Tabs: music (album art, synced lyrics, controls),
 system (CPU/RAM graphs, top programs), timer, calendar reminders.
 
 Run: pythonw island.py      (right-click the island to quit)
@@ -28,7 +28,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'system': (540, 220), 'timer
          'calendar': (580, 260), 'settings': (460, 300), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -330,8 +330,14 @@ def gtx(text, tl, dt):
     req = urllib.request.Request(
         f'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tl}&dt={dt}', body,
         headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.load(r)
+    for attempt in range(2):  # the free endpoint fails now and then
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.load(r)
+        except Exception:
+            if attempt:
+                raise
+            time.sleep(2)
 
 
 def enrich(lines, lang, romaji):
@@ -705,7 +711,7 @@ class Lyrics(QWidget):
         w, mid, bh = self.width(), self.height() / 2, self.block_h()
         if not self.lines:
             p.setPen(QColor(DIM))
-            p.setFont(self.small)
+            p.setFont(self.fonts['small'])
             p.drawText(self.rect(), Qt.AlignCenter, 'No synced lyrics for this song')
             return
         # split view: original on the left, romaji / translation on the right, same row per line
@@ -1386,6 +1392,8 @@ if __name__ == '__main__':
     if sys.argv[1:] == ['test']:
         selftest()
     elif single_instance():
+        _s = load_settings()  # before the media thread loads the first song's lyrics
+        prefs.update(lang=_s['translation'], romaji=bool(_s['pronunciation']))
         threading.Thread(target=lambda: asyncio.run(media_loop()), daemon=True).start()
         threading.Thread(target=scan_processes, daemon=True).start()
         app = QApplication(sys.argv)
