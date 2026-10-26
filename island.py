@@ -5,13 +5,15 @@ Run: pythonw island.py      (right-click the island to quit)
 Self-check: python island.py test
 """
 import asyncio, bisect, collections, ctypes, datetime as dt, faulthandler, json, os, pathlib, random, re, sys, threading, time, urllib.parse
-import shutil, subprocess, urllib.request, winreg, winsound
+import http.server, ipaddress, secrets, shutil, socket, subprocess, urllib.request, winreg, winsound
 
 import psutil
-from PySide6.QtCore import Qt, QDate, QPointF, QRect, QRectF, QTime, QTimer, QVariantAnimation, QEasingCurve
-from PySide6.QtGui import QColor, QCursor, QFont, QFontMetricsF, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
-from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QGraphicsOpacityEffect, QHBoxLayout, QLineEdit,
-                               QListWidget, QMenu, QPushButton, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
+from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QMimeData, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
+                            QVariantAnimation, QEasingCurve)
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
+from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QFileIconProvider,
+                               QGraphicsOpacityEffect, QHBoxLayout, QLineEdit, QListView, QListWidget, QListWidgetItem,
+                               QMenu, QPushButton, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
 from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as MediaManager
 from winrt.windows.storage.streams import Buffer, InputStreamOptions
 
@@ -23,12 +25,13 @@ MUSIC, SYSTEM, TIMER, CALENDAR = '\uE8D6', '\uE9D9', '\uE916', '\uE787'
 PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
 COMPACT_H, TOP, WIN = 36, 8, (820, 360)
 GEAR, LYRICS = '', ''
-TABS = ['music', 'lyrics', 'system', 'timer', 'calendar', 'settings']
-SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'system': (540, 220), 'timer': (400, 180),
-         'calendar': (580, 260), 'settings': (460, 300), 'alert': (400, 160)}
+SHELF, MONEY = '', ''
+TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'timer', 'calendar', 'settings']
+SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (660, 250), 'system': (540, 220),
+         'timer': (400, 180), 'calendar': (580, 260), 'settings': (460, 330), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.0.3'
+VERSION = '1.1.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -39,13 +42,16 @@ for _name in ('reminders.json', 'settings.json'):  # move data from older versio
         shutil.move(_old, DATA / _name)  # script may sit on another drive than AppData
 SAVE = DATA / 'reminders.json'
 SETTINGS_FILE = DATA / 'settings.json'
+SHELF_FILE = DATA / 'shelf.json'
+MONEY_FILE = DATA / 'money.json'
+MONEY_PORT = 8765
 if FROZEN:  # a windowed .exe has no console: keep errors in a file so bugs can be traced
     _log = open(DATA / 'error.log', 'a', encoding='utf-8', buffering=1)
     sys.stderr = _log
     faulthandler.enable(_log)
     threading.excepthook = lambda a: sys.excepthook(a.exc_type, a.exc_value, a.exc_traceback)
 DEFAULTS = {'tiny_fullscreen': True, 'compact_lyrics': True, 'sound': True, 'screen': 0,
-            'translation': None, 'pronunciation': None, 'auto_update': True}
+            'translation': None, 'pronunciation': None, 'auto_update': True, 'phone_sync': False, 'phone_key': None}
 TRANSLATIONS = [('Off', None), ('ไทย', 'th'), ('English', 'en'), ('日本語', 'ja')]
 PRONUNCIATIONS = [('Off', None), ('Romaji', 'romaji')]
 RUN_KEY, RUN_NAME = r'Software\Microsoft\Windows\CurrentVersion\Run', 'DynamicIsland'
@@ -173,6 +179,308 @@ def install_update(url):
         while chunk := r.read(1 << 16):
             f.write(chunk)
     subprocess.Popen([str(path), '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'])
+
+
+# ---------- money: KBank SMS / email / slip text from the iPhone -> income and expense ----------
+AMOUNT = r'(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+\.\d{1,2}|\d+)'
+IN_WORDS = ('เงินเข้า', 'รับโอน', 'รับเงิน', 'ได้รับ', 'ฝากเงิน', 'โอนเข้า', 'received', 'deposit', 'incoming',
+            'transfer in', 'credited')
+OUT_WORDS = ('เงินออก', 'ถอน', 'โอนเงิน', 'โอนออก', 'ชำระ', 'จ่าย', 'หักบัญชี', 'ซื้อ', 'paid', 'payment', 'withdraw',
+             'debited', 'transfer to', 'purchase')
+THAI_MONTHS = ('ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.')
+money, money_lock = [], threading.Lock()  # [{id, ts, amount, kind 'in'|'out', note, source, raw}]
+money_last = {'at': 0}  # newest added entry, for the pill flash
+
+
+def thai_year(y):
+    """K PLUS writes Buddhist years, often two digits: 69 -> 2026, 2569 -> 2026."""
+    y = int(y)
+    if y < 100:
+        return 2500 + y - 543 if y >= 60 else 2000 + y
+    return y - 543 if y > 2400 else y
+
+
+def parse_tx(text, source):
+    """Read a KBank SMS, alert email or slip (OCR text) -> {'ts', 'amount', 'kind'} or None.
+    shortcut: keyword rules from common K PLUS wording; unknown wording falls back to "out", fixable in the app."""
+    low = text.lower()
+    # balances and fees are amounts too, but not the transaction's
+    body = re.sub(r'(คงเหลือ|ยอดเงินคงเหลือ|balance|available|ค่าธรรมเนียม|fee)[^\d]{0,20}' + AMOUNT, ' ', text,
+                  flags=re.I)
+    m = (re.search(r'(?:จำนวน(?:เงิน)?|amount(?:\s*\(thb\))?|ยอดเงิน)\s*[:：]?\s*' + AMOUNT, body, re.I)
+         or re.search(AMOUNT + r'\s*(?:บาท|บ\.?(?![ก-๙])|thb|baht)', body, re.I)
+         or re.search(r'\d+\.\d{2}', body))
+    if not m:
+        return None
+    amount = float((m.group(1) if m.groups() else m.group(0)).replace(',', ''))
+    if amount <= 0:
+        return None
+    kind = 'in' if any(w in low for w in IN_WORDS) else 'out'
+    ts = time.time()
+    d = re.search(r'(\d{1,2})/(\d{1,2})/(\d{2,4})\D{0,3}(\d{1,2})[:.](\d{2})', text)
+    t = re.search(r'(\d{1,2})\s*(' + '|'.join(map(re.escape, THAI_MONTHS)) + r')\s*(\d{2,4})\D{0,6}(\d{1,2})[:.](\d{2})',
+                  text)
+    try:
+        if d:
+            ts = dt.datetime(thai_year(d[3]), int(d[2]), int(d[1]), int(d[4]), int(d[5])).timestamp()
+        elif t:
+            ts = dt.datetime(thai_year(t[3]), THAI_MONTHS.index(t[2]) + 1, int(t[1]), int(t[4]), int(t[5])).timestamp()
+    except ValueError:  # impossible date in the text: keep "now"
+        pass
+    return {'ts': ts, 'amount': amount, 'kind': kind}
+
+
+def load_money():
+    try:
+        money[:] = json.loads(MONEY_FILE.read_text('utf-8'))
+    except (OSError, ValueError):
+        money[:] = []
+
+
+def save_money():
+    tmp = MONEY_FILE.with_suffix('.tmp')  # write then swap: a crash mid-write must not lose the history
+    tmp.write_text(json.dumps(money, ensure_ascii=False), 'utf-8')
+    tmp.replace(MONEY_FILE)
+
+
+def add_tx(tx, source, raw=''):
+    """Store a transaction; the same transfer often arrives as SMS, email and slip, so merge those."""
+    with money_lock:
+        for old in money:
+            if old['kind'] == tx['kind'] and abs(old['amount'] - tx['amount']) < 0.005 \
+                    and abs(old['ts'] - tx['ts']) < 180:
+                if source not in old['source']:
+                    old['source'] += f'+{source}'
+                    save_money()
+                return old
+        new = {'id': secrets.token_hex(4), 'ts': tx['ts'], 'amount': round(tx['amount'], 2), 'kind': tx['kind'],
+               'note': tx.get('note', ''), 'source': source, 'raw': raw[:500]}
+        money.append(new)
+        money.sort(key=lambda x: x['ts'])
+        save_money()
+        money_last.update(tx=new, at=time.time())  # the island flashes it on the pill
+        return new
+
+
+def money_totals(now=None):
+    now = dt.datetime.fromtimestamp(now or time.time())
+    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    month0 = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    out = {'today_in': 0.0, 'today_out': 0.0, 'month_in': 0.0, 'month_out': 0.0}
+    with money_lock:
+        for t in money:
+            for start, period in ((day0, 'today'), (month0, 'month')):
+                if t['ts'] >= start:
+                    out[f'{period}_{t["kind"]}'] += t['amount']
+    return out
+
+
+def phone_addresses():
+    """URLs the iPhone can use: home Wi-Fi, and Tailscale (100.64.0.0/10) to reach the PC from anywhere."""
+    ips = set()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(('10.255.255.255', 1))  # no packet sent: just asks which interface routes outward
+            ips.add(s.getsockname()[0])
+        except OSError:
+            pass
+    for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+        ips.add(info[4][0])
+    tail = [ip for ip in ips if ipaddress.ip_address(ip) in TAILSCALE]
+    lan = [ip for ip in ips if ip not in tail and not ip.startswith('127.') and ipaddress.ip_address(ip).is_private]
+    return lan[:1], tail[:1]
+
+
+TAILSCALE = ipaddress.ip_network('100.64.0.0/10')
+
+
+class MoneyHandler(http.server.BaseHTTPRequestHandler):
+    """Receiver for the iPhone: Shortcuts POST bank texts, the web app reads and edits. Only private networks
+    and Tailscale may connect, and every call carries the pairing key."""
+    key, icon = None, b''
+
+    def log_message(self, *a):  # no console in the packaged app
+        pass
+
+    def allowed(self):
+        ip = ipaddress.ip_address(self.client_address[0])
+        return ip.is_private or ip.is_loopback or ip in TAILSCALE
+
+    def send(self, code, body, ctype='application/json'):
+        data = body if isinstance(body, bytes) else (json.dumps(body, ensure_ascii=False) if ctype ==
+                                                     'application/json' else body).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', ctype + ('; charset=utf-8' if 'json' in ctype or 'html' in ctype else ''))
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if not self.allowed():
+            return self.send(403, {'error': 'not allowed'})
+        url = urllib.parse.urlparse(self.path)
+        k = urllib.parse.parse_qs(url.query).get('k', [''])[0]
+        if url.path == f'/app/{self.key}':
+            return self.send(200, MONEY_APP.replace('__KEY__', self.key), 'text/html')
+        if url.path == f'/manifest/{self.key}.json':
+            return self.send(200, {'name': 'Island Money', 'short_name': 'Money', 'display': 'standalone',
+                                   'start_url': f'/app/{self.key}', 'background_color': '#000000',
+                                   'theme_color': '#000000', 'icons': [{'src': '/icon.png', 'sizes': '180x180',
+                                                                        'type': 'image/png'}]})
+        if url.path == '/icon.png':
+            return self.send(200, self.icon, 'image/png')
+        if url.path == '/api/tx' and secrets.compare_digest(k, self.key):
+            with money_lock:
+                items = [{k2: v for k2, v in t.items() if k2 != 'raw'} for t in money[-300:]]
+            return self.send(200, {'tx': items, 'totals': money_totals()})
+        self.send(404, {'error': 'not found'})
+
+    def do_POST(self):
+        if not self.allowed():
+            return self.send(403, {'error': 'not allowed'})
+        try:
+            body = json.loads(self.rfile.read(min(int(self.headers.get('Content-Length', 0)), 65536)) or b'{}')
+        except ValueError:
+            return self.send(400, {'error': 'bad json'})
+        if not secrets.compare_digest(str(body.get('key', '')), self.key):
+            return self.send(403, {'error': 'wrong key'})
+        path = urllib.parse.urlparse(self.path).path
+        if path == '/api/tx':
+            source = str(body.get('source') or 'manual')[:12]
+            if body.get('amount') not in (None, ''):  # typed in the app
+                try:
+                    tx = {'ts': time.time(), 'amount': abs(float(body['amount'])),
+                          'kind': 'in' if body.get('kind') == 'in' else 'out', 'note': str(body.get('note', ''))[:80]}
+                except ValueError:
+                    return self.send(400, {'error': 'bad amount'})
+            else:  # bank text from a Shortcut
+                text = str(body.get('text', ''))
+                tx = parse_tx(text, source)
+                if not tx:
+                    return self.send(422, {'error': 'no amount found'})
+                tx['note'] = 'KBank'
+            return self.send(200, add_tx(tx, source, str(body.get('text', ''))))
+        if path == '/api/edit':
+            with money_lock:
+                t = next((t for t in money if t['id'] == body.get('id')), None)
+                if not t:
+                    return self.send(404, {'error': 'no such entry'})
+                if body.get('delete'):
+                    money.remove(t)
+                else:
+                    if body.get('kind') in ('in', 'out'):
+                        t['kind'] = body['kind']
+                    if 'note' in body:
+                        t['note'] = str(body['note'])[:80]
+                save_money()
+            return self.send(200, {'ok': True})
+        self.send(404, {'error': 'not found'})
+
+
+MONEY_APP = '''<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Money">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest/__KEY__.json"><link rel="apple-touch-icon" href="/icon.png">
+<title>Island Money</title><style>
+:root{--bg:#000;--card:#1c1c1e;--line:#2c2c2e;--fg:#fff;--dim:#8e8e93;--in:#30d158;--out:#ff453a;--blue:#0a84ff}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px -apple-system,system-ui,sans-serif;
+ padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 24px)}
+h1{font-size:28px;margin:18px 0 12px}h2{font-size:13px;color:var(--dim);font-weight:600;text-transform:uppercase;margin:22px 4px 8px}
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px}.card{background:var(--card);border-radius:14px;padding:14px}
+.card small{color:var(--dim);font-size:13px}.in{color:var(--in)}.out{color:var(--out)}.big{font-size:20px;font-weight:700;margin-top:4px}
+.list{background:var(--card);border-radius:14px;overflow:hidden}
+.tx{display:flex;align-items:center;gap:10px;padding:12px 14px;border-top:1px solid var(--line)}.tx:first-child{border-top:0}
+.tx .w{flex:1;min-width:0}.tx .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tx .s{color:var(--dim);font-size:12px}
+.tx .a{font-weight:600;font-variant-numeric:tabular-nums}
+button{font:inherit;border:0;border-radius:10px;padding:10px 14px;background:var(--line);color:var(--fg)}
+.icon{padding:6px 9px;font-size:14px;background:transparent;color:var(--dim)}
+form{display:grid;grid-template-columns:1fr auto;gap:8px}
+input{font:inherit;width:100%;padding:12px;border-radius:10px;border:0;background:var(--card);color:var(--fg)}
+.seg{display:flex;gap:6px}.seg button.on{background:var(--blue)}.full{grid-column:1/-1}
+.steps{background:var(--card);border-radius:14px;padding:6px 16px;color:#d1d1d6;font-size:14px;line-height:1.5}
+code{background:#000;padding:2px 6px;border-radius:6px;word-break:break-all;font-size:13px}
+.empty{color:var(--dim);padding:18px 14px;text-align:center}</style></head><body>
+<h1>Money</h1>
+<div class="cards"><div class="card"><small>Today</small><div class="big in" id="ti"></div><div class="big out" id="to"></div></div>
+<div class="card"><small>This month</small><div class="big in" id="mi"></div><div class="big out" id="mo"></div></div></div>
+<h2>Add</h2>
+<form id="f"><input id="amt" inputmode="decimal" placeholder="Amount ฿" required>
+<div class="seg"><button type="button" id="bo" class="on">Out</button><button type="button" id="bi">In</button></div>
+<input id="note" class="full" placeholder="Note (food, salary…)"><button class="full" style="background:var(--blue)">Add</button></form>
+<h2>History</h2><div class="list" id="list"></div>
+<h2>iPhone Shortcuts setup</h2><div class="steps">
+<p>Each Shortcut ends with <b>Get Contents of URL</b>: URL <code id="ep"></code>, Method <b>POST</b>,
+Request Body <b>JSON</b> with <code>key</code> = <code>__KEY__</code>, <code>source</code> (below) and
+<code>text</code> = the input.</p>
+<p><b>1. KBank SMS</b> — Automation → Message → Sender contains <code>KBank</code> → Run Immediately →
+Get Contents of URL with <code>source</code> = <code>sms</code>, <code>text</code> = Shortcut Input.</p>
+<p><b>2. KBank email</b> — Automation → Email → Sender = KBank's alert address → Run Immediately →
+Get Contents of URL with <code>source</code> = <code>email</code>, <code>text</code> = Shortcut Input.</p>
+<p><b>3. Slip</b> — new Shortcut, Show in Share Sheet, accepts Images → Extract Text from Image →
+Get Contents of URL with <code>source</code> = <code>slip</code>, <code>text</code> = Text. Share a slip → this Shortcut.</p>
+<p>Away from home Wi-Fi? Install Tailscale on the PC and the iPhone and use the island's Tailscale address.</p></div>
+<script>
+const K='__KEY__',$=id=>document.getElementById(id);let kind='out';
+const baht=n=>n.toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2})+' ฿';
+$('ep').textContent=location.origin+'/api/tx';
+$('bo').onclick=()=>{kind='out';$('bo').className='on';$('bi').className=''};
+$('bi').onclick=()=>{kind='in';$('bi').className='on';$('bo').className=''};
+const post=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,...b})});
+async function load(){
+ const d=await (await fetch('/api/tx?k='+K)).json(),t=d.totals;
+ $('ti').textContent='+'+baht(t.today_in);$('to').textContent='−'+baht(t.today_out);
+ $('mi').textContent='+'+baht(t.month_in);$('mo').textContent='−'+baht(t.month_out);
+ const L=$('list');L.innerHTML='';
+ if(!d.tx.length){L.innerHTML='<div class="empty">Nothing yet</div>';return}
+ for(const x of d.tx.slice().reverse()){
+  const r=document.createElement('div');r.className='tx';const when=new Date(x.ts*1000);
+  r.innerHTML=`<div class="w"><div class="n"></div><div class="s"></div></div><div class="a ${x.kind}"></div>
+   <button class="icon" title="Switch in/out">⇄</button><button class="icon" title="Delete">✕</button>`;
+  r.querySelector('.n').textContent=x.note||x.source;
+  r.querySelector('.s').textContent=when.toLocaleString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})+' · '+x.source;
+  r.querySelector('.a').textContent=(x.kind=='in'?'+':'−')+baht(x.amount);
+  const [flip,del]=r.querySelectorAll('button');
+  flip.onclick=async()=>{await post('/api/edit',{id:x.id,kind:x.kind=='in'?'out':'in'});load()};
+  del.onclick=async()=>{if(confirm('Delete this entry?')){await post('/api/edit',{id:x.id,delete:true});load()}};
+  r.querySelector('.n').onclick=async()=>{const n=prompt('Note',x.note);if(n!==null){await post('/api/edit',{id:x.id,note:n});load()}};
+  L.appendChild(r)}}
+$('f').onsubmit=async e=>{e.preventDefault();
+ await post('/api/tx',{amount:$('amt').value.replace(/,/g,''),kind,note:$('note').value,source:'manual'});
+ $('amt').value='';$('note').value='';load()};
+load();setInterval(load,5000);
+</script></body></html>'''
+
+
+def start_money_server(key, icon):
+    MoneyHandler.key, MoneyHandler.icon = key, icon
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', MONEY_PORT), MoneyHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def icon_png(size=180):
+    """The island icon as PNG bytes, for the iPhone Home Screen (iOS wants PNG). Needs the Qt GUI thread."""
+    img = QImage(size, size, QImage.Format_ARGB32)
+    img.fill(QColor(BG))
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    s = size / 256
+    p.setBrush(QColor('#1c1c1e'))
+    p.drawRoundedRect(QRectF(8 * s, 78 * s, 240 * s, 100 * s), 50 * s, 50 * s)
+    p.setBrush(QColor(GREEN))
+    for x, h in ((150, 40), (170, 64), (190, 30), (210, 52)):
+        p.drawRoundedRect(QRectF(x * s, (128 - h / 2) * s, 11 * s, h * s), 5.5 * s, 5.5 * s)
+    p.setBrush(QColor(FG))
+    p.drawEllipse(QRectF(40 * s, 106 * s, 44 * s, 44 * s))
+    p.end()
+    buf = QBuffer()
+    buf.open(QBuffer.WriteOnly)
+    img.save(buf, 'PNG')
+    return bytes(buf.data())
 
 
 def single_instance():
@@ -800,6 +1108,59 @@ class Lyrics(QWidget):
         p.restore()
 
 
+class ShelfList(QListWidget):
+    """Files parked on the island: drag them back out to any app (they are copied, the shelf keeps them),
+    double-click opens, Delete removes. Drops are handled by the island so the whole pill is a target."""
+
+    def __init__(self, on_change):
+        super().__init__(viewMode=QListView.IconMode, flow=QListView.LeftToRight, wrapping=True,
+                         resizeMode=QListView.Adjust, movement=QListView.Static, iconSize=QSize(36, 36),
+                         gridSize=QSize(88, 70), selectionMode=QListWidget.ExtendedSelection, dragEnabled=True,
+                         wordWrap=False, textElideMode=Qt.ElideMiddle)
+        self.on_change, self.icons, self.dragging = on_change, QFileIconProvider(), False
+        self.itemDoubleClicked.connect(lambda item: os.startfile(item.data(Qt.UserRole)))
+
+    def paths(self):
+        return [self.item(i).data(Qt.UserRole) for i in range(self.count())]
+
+    def add(self, paths):
+        have = set(self.paths())
+        for path in paths:
+            if path not in have and os.path.exists(path):
+                item = QListWidgetItem(self.icons.icon(QFileInfo(path)), os.path.basename(path.rstrip('\\/')) or path)
+                item.setData(Qt.UserRole, path)
+                item.setToolTip(path)
+                self.addItem(item)
+                have.add(path)
+        self.on_change()
+
+    def remove_selected(self):
+        for item in self.selectedItems():
+            self.takeItem(self.row(item))
+        self.on_change()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.remove_selected()
+        else:
+            super().keyPressEvent(e)
+
+    def mimeData(self, items):
+        m = QMimeData()
+        m.setUrls([QUrl.fromLocalFile(i.data(Qt.UserRole)) for i in items])
+        return m
+
+    def supportedDropActions(self):  # what a drag out offers: copy, so Explorer can't move the file away
+        return Qt.CopyAction
+
+    def startDrag(self, actions):
+        self.dragging = True  # keep the island open while the file is carried out
+        try:
+            super().startDrag(actions)
+        finally:
+            self.dragging = False
+
+
 class Switch(QAbstractButton):  # macOS-style toggle
     def __init__(self, on, cb):
         super().__init__(checkable=True, checked=on)
@@ -901,6 +1262,7 @@ class Island(QWidget):
         first_run = not SETTINGS_FILE.exists()
         self.settings, self.tiny, self.fs_at = load_settings(), False, 0
         self.updating, self.quit_now = None, False  # set by the update thread, acted on in tick
+        self.drop_hover = False  # files dragged over the island
         if first_run and FROZEN:  # freshly installed: start with Windows by default (toggle in Settings)
             autostart(True)
             self.set_setting('auto_update', True)
@@ -914,7 +1276,13 @@ class Island(QWidget):
         self.shape = QRectF()
         self.anim = QVariantAnimation(self, duration=550)
         self.anim.valueChanged.connect(self.set_shape)
+        load_money()
+        self.money_server, self.money_at, self.flash = None, 0, None  # flash: (text, color, until)
+        money_last['at'] = 0  # entries loaded from disk are not news
+        if not self.settings['phone_key']:
+            self.set_setting('phone_key', secrets.token_urlsafe(9))  # pairing key in every phone URL and Shortcut
         self.build()
+        self.set_phone_sync(self.settings['phone_sync'])
         self.shape = self.target()
         self.morph()
         self.tick_timer = QTimer(self, timeout=self.tick, interval=100)
@@ -953,7 +1321,7 @@ class Island(QWidget):
         # expanded header: date left, tabs right
         self.f_date = Text(8, DIM)
         self.tab_buttons = [icon_button(g, 10, lambda _=False, t=t: self.set_tab(t))
-                            for g, t in zip((MUSIC, LYRICS, SYSTEM, TIMER, CALENDAR, GEAR), TABS)]
+                            for g, t in zip((MUSIC, LYRICS, SHELF, MONEY, SYSTEM, TIMER, CALENDAR, GEAR), TABS)]
         header = row(self.f_date, None, *self.tab_buttons, spacing=0)
 
         # media page
@@ -987,6 +1355,45 @@ class Island(QWidget):
         bottom.layout().setStretch(0, 1)
         lyrics_page = column(self.l_song, self.lyrics, bottom, spacing=4)
         lyrics_page.layout().setStretch(1, 1)
+
+        # shelf page: files dropped on the island
+        self.shelf_hint = Text(8, DIM)
+        self.shelf = ShelfList(self.save_shelf)
+        try:
+            self.shelf.add(json.loads(SHELF_FILE.read_text('utf-8')))  # files deleted since are skipped
+        except (OSError, ValueError):
+            pass
+        shelf_bottom = row(self.shelf_hint, pill_button('Remove', self.shelf.remove_selected),
+                           pill_button('Clear', lambda: (self.shelf.clear(), self.save_shelf())), spacing=6)
+        shelf_bottom.layout().setStretch(0, 1)
+        shelf_page = column(self.shelf, shelf_bottom, spacing=6)
+        shelf_page.layout().setStretch(0, 1)
+        self.setAcceptDrops(True)
+        self.save_shelf()  # writes back without missing files, sets the hint
+
+        # money page: today / month totals, latest entries, phone link
+        self.m_totals = [Text(14, GREEN, bold=True), Text(14, RED, bold=True),
+                         Text(14, GREEN, bold=True), Text(14, RED, bold=True)]
+        heads = []
+        for label in ('TODAY', 'THIS MONTH'):
+            heads.append(Text(8, DIM))
+            heads[-1].set(label)
+        for w in self.m_totals + heads:  # Text has no natural width; without this the list squeezes them to 0
+            w.setFixedWidth(118)
+        self.m_rows = [(Text(9, DIM), Text(9), Text(10, bold=True, align=Qt.AlignRight)) for _ in range(4)]
+        for when, _, amount in self.m_rows:
+            when.setFixedWidth(72)
+            amount.setFixedWidth(96)
+        self.m_link = Text(8, DIM)
+        self.b_phone = pill_button('Connect iPhone', lambda: self.set_phone_sync(True))
+        self.b_open = pill_button('Open', lambda: os.startfile(self.phone_url()) if self.phone_url() else None)
+        money_page = column(
+            row(column(heads[0], self.m_totals[0], self.m_totals[1], spacing=0),
+                column(heads[1], self.m_totals[2], self.m_totals[3], spacing=0),
+                column(*(row(*r, spacing=6) for r in self.m_rows), None, spacing=2), spacing=18),
+            None, row(self.m_link, self.b_phone, self.b_open, spacing=6), spacing=6)
+        money_page.layout().itemAt(0).widget().layout().setStretch(2, 1)
+        money_page.layout().itemAt(2).widget().layout().setStretch(0, 1)
 
         # system page: graphs | top programs
         self.g_cpu, self.g_ram = Graph('CPU', BLUE), Graph('RAM', PURPLE)
@@ -1072,6 +1479,7 @@ class Island(QWidget):
             setting('Lyrics pronunciation', choice('pronunciation', PRONUNCIATIONS)),
             setting('Alert sound', toggle('sound')),
             setting(f'Auto update  ·  v{VERSION}', toggle('auto_update')),
+            setting('iPhone sync for Money', Switch(self.settings['phone_sync'], self.set_phone_sync)),
             setting('Screen', self.screen_box),
             row(None, pill_button('Quit island', QApplication.quit)), spacing=6)
 
@@ -1081,7 +1489,8 @@ class Island(QWidget):
                             spacing=12)
 
         self.pages = QStackedWidget()
-        for name, page in zip(TABS + ['alert'], (media_page, lyrics_page, system_page, timer_page, calendar_page,
+        for name, page in zip(TABS + ['alert'], (media_page, lyrics_page, shelf_page, money_page, system_page, timer_page,
+                                                 calendar_page,
                                                  settings_page, alert_page)):
             page.setObjectName(name)
             self.pages.addWidget(page)
@@ -1110,6 +1519,44 @@ class Island(QWidget):
         prefs.update(lang=self.settings['translation'], romaji=bool(self.settings['pronunciation']))
         media['reload'] = True  # fetch again with the new translation / romaji
 
+    # --- money / iPhone ---
+    def set_phone_sync(self, on):
+        self.set_setting('phone_sync', on)
+        if on and not self.money_server:
+            try:
+                self.money_server = start_money_server(self.settings['phone_key'], icon_png())
+            except OSError as e:  # port taken by another program
+                self.m_link.set(f'Phone sync failed: port {MONEY_PORT} busy ({e.strerror})', RED)
+                return
+        elif not on and self.money_server:
+            self.money_server.shutdown()
+            self.money_server.server_close()
+            self.money_server = None
+        self.b_phone.setVisible(not self.money_server)
+        self.b_open.setVisible(bool(self.money_server))
+        self.m_link.set(f'iPhone: {self.phone_url()}  (Safari → Share → Add to Home Screen)' if self.money_server
+                        else 'Connect your iPhone to add KBank SMS, emails and slips', DIM)
+
+    def phone_url(self):
+        if not self.money_server:
+            return ''
+        lan, tail = phone_addresses()
+        host = (tail or lan or ['127.0.0.1'])[0]  # Tailscale works at home and away
+        return f'http://{host}:{MONEY_PORT}/app/{self.settings["phone_key"]}'
+
+    def refresh_money(self):
+        t = money_totals()
+        for w, v, sign in zip(self.m_totals, (t['today_in'], t['today_out'], t['month_in'], t['month_out']),
+                              '+−+−'):
+            w.set(f'{sign}{v:,.2f} ฿')
+        with money_lock:
+            latest = money[-4:][::-1]
+        for (when, note, amount), tx in zip(self.m_rows, latest + [None] * 4):
+            when.set(time.strftime('%d %b %H:%M', time.localtime(tx['ts'])) if tx else '')
+            note.set((tx['note'] or tx['source']) if tx else '')
+            amount.set(f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} ฿' if tx else '',
+                       (GREEN if tx['kind'] == 'in' else RED) if tx else None)
+
     def request_sync(self):
         key, vid, plain = (media.get('title'), media.get('artist')), media.get('video_id'), media.get('plain')
         if vid and plain and not media.get('gen'):
@@ -1128,7 +1575,7 @@ class Island(QWidget):
             w, h = TINY
             return QRectF((self.width() - w) / 2, 2, w, h)
         else:
-            w, h = (320 if self.alert or media.get('playing') or self.timer_end else 150), COMPACT_H
+            w, h = (320 if self.alert or self.flash or media.get('playing') or self.timer_end else 150), COMPACT_H
         return QRectF((self.width() - w) / 2, TOP, w, h)
 
     def morph(self):
@@ -1165,6 +1612,42 @@ class Island(QWidget):
         p.setBrush(QColor(BG))
         r = min(self.shape.height() / 2, 34)
         p.drawRoundedRect(self.shape, r, r)
+        if self.drop_hover:  # files are being dragged over: outline says "drop here"
+            p.setPen(QPen(QColor(GREEN), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(self.shape.adjusted(1, 1, -1, -1), r - 1, r - 1)
+
+    # --- shelf: drop files anywhere on the island ---
+    @staticmethod
+    def local_files(e):
+        return [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()] if e.mimeData().hasUrls() else []
+
+    def dragEnterEvent(self, e):
+        if self.local_files(e) and not self.shelf.dragging:  # not our own tiles being dragged out
+            e.acceptProposedAction()
+            self.drop_hover, self.expanded, self.tab = True, True, 'shelf'
+            self.tick()
+
+    def dragMoveEvent(self, e):
+        if self.drop_hover:
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self.drop_hover = False
+        self.update()
+        QTimer.singleShot(350, self.maybe_collapse)
+
+    def dropEvent(self, e):
+        self.drop_hover = False
+        self.shelf.add(self.local_files(e))
+        e.acceptProposedAction()
+        self.update()
+
+    def save_shelf(self):
+        SHELF_FILE.write_text(json.dumps(self.shelf.paths()), 'utf-8')
+        n = self.shelf.count()
+        self.shelf_hint.set(f'{n} file{"s" * (n != 1)} · drag out to use, double-click to open' if n else
+                            'Drop files on the island to keep them here')
 
     # --- hover ---
     def enterEvent(self, e):
@@ -1182,7 +1665,7 @@ class Island(QWidget):
         inside = self.shape.contains(QPointF(self.mapFromGlobal(QCursor.pos())))
         focus = QApplication.focusWidget()
         typing = self.isActiveWindow() and focus is not None and self.full.isAncestorOf(focus)
-        if not inside and not typing and not self.alert:
+        if not inside and not typing and not self.alert and not self.shelf.dragging and not self.drop_hover:
             self.expanded, self.tab = False, None
             self.morph()
 
@@ -1293,6 +1776,14 @@ class Island(QWidget):
         if now - self.fs_at >= 0.5:  # fullscreen check twice a second
             self.fs_at = now
             self.tiny = self.settings['tiny_fullscreen'] and fullscreen_in_front(int(self.winId()))
+        if money_last['at']:  # a new transaction from the iPhone, not shown yet
+            tx = money_last['tx']
+            self.flash = (f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} ฿  ·  {tx["note"] or tx["source"]}',
+                          GREEN if tx['kind'] == 'in' else RED, money_last['at'] + 6)
+            money_last['at'] = 0
+            self.refresh_money()
+        if self.flash and now > self.flash[2]:
+            self.flash = None
 
         if media.get('art_key') != self.art_key:
             self.art_key = media.get('art_key')
@@ -1319,6 +1810,8 @@ class Island(QWidget):
         self.c_timer.set(timer)
         if self.alert:
             self.c_text.set(self.alert, ORANGE)
+        elif self.flash:
+            self.c_text.set(self.flash[0], self.flash[1])
         elif lyric and self.settings['compact_lyrics']:
             self.c_text.set(lyric, self.c_wave.color)
         else:
@@ -1340,6 +1833,9 @@ class Island(QWidget):
         self.f_title.set(title or 'Nothing playing')
         self.f_artist.set(media.get('artist', ''))
         self.f_lyric.set(lyric)
+        if page == 'money' and now - self.money_at > 2:  # totals change slowly
+            self.money_at = now
+            self.refresh_money()
         if page == 'lyrics':
             self.l_song.set(f'{title} · {media.get("artist", "")}' if title else 'Nothing playing')
             self.lyrics.show_lines(media.get('lyrics') or [], lyric_index())
@@ -1391,6 +1887,26 @@ def selftest():
     media.clear()
     assert mmss(125.7) == '2:05' and mmss(-3) == '0:00'
     assert snapshot()[os.getpid()][0].lower().startswith('python')
+    when = dt.datetime(2026, 10, 26, 14, 5).timestamp()
+    sms_in = parse_tx('26/10/69 14:05 บชX1234X รับโอนจากX5678X 500.00บ คงเหลือ 12,345.67บ', 'sms')
+    assert sms_in == {'ts': when, 'amount': 500.0, 'kind': 'in'}, sms_in
+    sms_out = parse_tx('26/10/69 18:30 บชX1234X โอนเงิน 1,250.00บ คงเหลือ 11,095.67บ', 'sms')
+    assert sms_out['kind'] == 'out' and sms_out['amount'] == 1250.0
+    mail = parse_tx('Transaction Date: 26/10/2026 09:15 Transaction: Transfer to X5678 Amount (THB): 2,000.00 '
+                    'Fee (THB): 0.00 Available Balance (THB): 9,095.67', 'email')
+    assert mail['kind'] == 'out' and mail['amount'] == 2000.0, mail
+    slip = parse_tx('โอนเงินสำเร็จ\n26 ต.ค. 69 14:05 น.\nนาย ก\nจำนวน:\n350.00 บาท\nค่าธรรมเนียม:\n0.00 บาท', 'slip')
+    assert slip == {'ts': when, 'amount': 350.0, 'kind': 'out'}, slip
+    assert parse_tx('สวัสดีครับ', 'sms') is None
+    global MONEY_FILE
+    saved_file, MONEY_FILE = MONEY_FILE, pathlib.Path(os.environ.get('TEMP', '.')) / 'island_money_test.json'
+    money.clear()
+    a = add_tx(sms_in, 'sms')
+    b = add_tx({**sms_in, 'ts': when + 60}, 'slip')  # same transfer reported twice: merged
+    assert a is b and a['source'] == 'sms+slip' and len(money) == 1
+    money.clear()
+    MONEY_FILE.unlink(missing_ok=True)
+    MONEY_FILE = saved_file
     print('ok')
 
 
