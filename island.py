@@ -4,11 +4,11 @@ system (CPU/RAM graphs, top programs), timer, calendar reminders.
 Run: pythonw island.py      (right-click the island to quit)
 Self-check: python island.py test
 """
-import asyncio, bisect, collections, ctypes, datetime as dt, faulthandler, json, os, pathlib, random, re, sys, threading, time, urllib.parse
+import asyncio, bisect, collections, ctypes, datetime as dt, faulthandler, functools, json, math, os, pathlib, random, re, sys, threading, time, urllib.parse
 import http.server, ipaddress, secrets, shutil, socket, subprocess, urllib.request, winreg, winsound
 
 import psutil
-from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QMimeData, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
+from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
                             QVariantAnimation, QEasingCurve)
 from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QFileIconProvider,
@@ -36,15 +36,15 @@ FONT_DIR = pathlib.Path(getattr(sys, '_MEIPASS', pathlib.Path(__file__).parent))
 PREV, PLAY, PAUSE, NEXT = '\uE892', '\uE768', '\uE769', '\uE893'
 MUSIC, SYSTEM, TIMER, CALENDAR = '\uE8D6', '\uE9D9', '\uE916', '\uE787'
 PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
-COMPACT_H, TOP, WIN = 36, 8, (820, 400)
+COMPACT_H, TOP, WIN = 36, 8, (820, 430)
 GEAR, LYRICS = '', ''
 SHELF, MONEY = '', ''
 TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'timer', 'calendar', 'settings']
 SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 250), 'system': (540, 220),
-         'timer': (400, 180), 'calendar': (580, 260), 'settings': (460, 362), 'alert': (400, 160)}
+         'timer': (400, 180), 'calendar': (580, 260), 'settings': (500, 392), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -65,7 +65,8 @@ if FROZEN:  # a windowed .exe has no console: keep errors in a file so bugs can 
     threading.excepthook = lambda a: sys.excepthook(a.exc_type, a.exc_value, a.exc_traceback)
 DEFAULTS = {'tiny_fullscreen': True, 'compact_lyrics': True, 'sound': True, 'screen': 0,
             'translation': None, 'pronunciation': None, 'auto_update': True, 'phone_sync': False, 'phone_key': None,
-            'fox': True}
+            'fox': True, 'fox_sleep': 7200}
+FOX_SLEEP_AFTER = [('30 min', 1800), ('1 hour', 3600), ('2 hours', 7200), ('3 hours', 10800)]
 TRANSLATIONS = [('Off', None), ('ไทย', 'th'), ('English', 'en'), ('日本語', 'ja')]
 PRONUNCIATIONS = [('Off', None), ('Romaji', 'romaji')]
 RUN_KEY, RUN_NAME = r'Software\Microsoft\Windows\CurrentVersion\Run', 'DynamicIsland'
@@ -678,6 +679,42 @@ class MonitorInfo(ctypes.Structure):
     _fields_ = [('cbSize', ctypes.c_ulong), ('rcMonitor', Rect), ('rcWork', Rect), ('dwFlags', ctypes.c_ulong)]
 
 
+def keyboard_language():
+    """(native language name, short label) of the keyboard in the foreground app, e.g. ('ไทย', 'TH'),
+    ('日本語', 'あ') when the Japanese IME types kana, ('日本語', 'A') when it types letters."""
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.GetKeyboardLayout.restype = ctypes.c_void_p
+    hwnd = user32.GetForegroundWindow()
+    tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), None)
+    lcid = (user32.GetKeyboardLayout(tid) or 0) & 0xFFFF
+    if lcid not in LANG_NAMES:  # look a language up once; this runs 4 times a second
+        name = ctypes.create_unicode_buffer(85)
+        if not kernel32.LCIDToLocaleName(lcid, name, 85, 0):
+            return None
+        native = ctypes.create_unicode_buffer(80)
+        kernel32.GetLocaleInfoEx(name.value, 0x4, native, 80)  # LOCALE_SNATIVELANGUAGENAME
+        LANG_NAMES[lcid] = (native.value or name.value, name.value.split('-')[0].upper())
+    native, label = LANG_NAMES[lcid]
+    if label == 'JA':  # the IME's open state is kana input, closed is plain letters
+        ctypes.windll.imm32.ImmGetDefaultIMEWnd.restype = ctypes.c_void_p
+        ime = ctypes.windll.imm32.ImmGetDefaultIMEWnd(ctypes.c_void_p(hwnd))
+        label = 'あ' if ime and user32.SendMessageW(ctypes.c_void_p(ime), 0x283, 0x5, 0) else 'A'  # IMC_GETOPENSTATUS
+    return native, label
+
+
+LANG_NAMES = {}  # keyboard LCID -> (native name, label)
+
+
+def idle_seconds():
+    """Seconds since the last mouse or keyboard input anywhere (the fox sleeps after a while)."""
+    class LastInput(ctypes.Structure):
+        _fields_ = [('cbSize', ctypes.c_uint), ('dwTime', ctypes.c_uint)]
+    info = LastInput(ctypes.sizeof(LastInput), 0)
+    ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info))
+    return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000
+
+
 def fullscreen_in_front(own_hwnd):
     """True when the foreground window covers the whole monitor the island is on (game, fullscreen video)."""
     user32 = ctypes.windll.user32
@@ -1008,9 +1045,20 @@ class Text(QWidget):  # one elided line; a QLabel would widen the island on long
             self.text, self.color = text, QColor(color or self.color)
             self.update()
 
+    @functools.lru_cache(maxsize=64)
+    def shown(self, text, width):  # the elided text; repaints (a fox running past) don't measure it again
+        return self.fontMetrics().elidedText(text, Qt.ElideRight, width)
+
+    def text_box(self):
+        """Where the text (with its backdrop) sits, in the parent island's coordinates."""
+        text = self.shown(self.text, self.width())
+        tw = self.fontMetrics().horizontalAdvance(text) + 12
+        left = self.mapTo(self.window(), QPoint(0, 0)).x() + (self.width() - tw) / 2
+        return QRectF(left, 0, tw, self.height())
+
     def paintEvent(self, e):
         p = QPainter(self)
-        text = self.fontMetrics().elidedText(self.text, Qt.ElideRight, self.width())
+        text = self.shown(self.text, self.width())
         if self.backdrop and text:
             box = p.boundingRect(self.rect(), self.align | Qt.AlignVCenter, text).adjusted(-6, -4, 6, 4)
             p.fillRect(box, QColor(BG))
@@ -1354,57 +1402,232 @@ FOX_BODY = ['           o o  ',  # 16 x 8 pixel fox facing right: o orange, w wh
             '   oooooooooo   ']
 FOX_LEGS = (['    o o   o o   ', '    d d   d d   '],  # standing / stride 1
             ['   o   o o   o  ', '  d     d d   d '])  # stride 2
+FOX_SIT = ['           o o  ',  # sitting, tail around the paws; the wag frame moves the tail tip
+           '          ooooo ',
+           '          oodooo',
+           '         ooooowd',
+           '        ooooooww',
+           '  ww   ooooooo  ',
+           ' wooooooooooo   ',
+           '         d d    ']
+FOX_WAG = FOX_SIT[:5] + ['   ww  ooooooo  ', '  woooooooooo   ', FOX_SIT[7]]
+FOX_SLEEP = ['                ',  # curled up, eye closed, tail over the nose
+             '                ',
+             '      ooooo o o ',
+             '    ooooooooooo ',
+             '   ooooooooodoo ',
+             '  wwoooooooooowd',
+             '   wwwwooooooo  ',
+             '                ']
 FOX_COLORS = {'o': THEME['fox'], 'w': THEME['fox-cream'], 'd': THEME['fox-ink']}
 
 
 class Fox(QWidget):
-    """Idle buddy: runs back and forth in the closed pill when nothing plays, rests a moment at each end."""
+    """Idle buddy in the closed pill when nothing plays. Runs back and forth and, between runs, picks something
+    at random: stands, sits and wags, or looks around. Curls up asleep after the PC sits untouched for the
+    time set in Settings, with z's floating up, and wakes when you come back."""
     PX = 2  # screen pixels per fox pixel
+    W, H, Z = 32, 16, 10  # fox size in px, plus room above it (inside the pill) for the z's
 
     def __init__(self, island):
         super().__init__(island)
         self.island = island
-        self.setFixedSize(16 * self.PX, 8 * self.PX)
+        self.setFixedSize(self.W + 12, self.H + self.Z)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)  # hovering the fox still opens the island
-        self.x, self.dir, self.frame, self.rest_until = 0.0, 1, 0, 0.0
+        self.x, self.dir, self.frame, self.state, self.until = 0.0, 1, 0, 'run', 0.0
+        self.idle_at, self.asleep = 0.0, False
         self.timer = QTimer(self, timeout=self.step, interval=90)
 
     def set_active(self, on):
         if on and not self.timer.isActive():
-            r = self.island.shape
-            self.x = r.left() + 12
-            self.timer.start()
+            self.x, self.state = self.island.shape.left() + 12, 'run'
+            self.timer.start(90)
             self.show()
             self.step()
+            self.island.petals.burst()  # a little sakura drift as the fox comes out
         elif not on and self.timer.isActive():
             self.timer.stop()
             self.hide()
 
+    def go(self, state, seconds=0.0):
+        self.state, self.until = state, time.time() + seconds
+        # frames per state: running needs them; a resting or sleeping fox barely moves, so save CPU
+        self.timer.setInterval({'run': 90, 'sleep': 400}.get(state, 220))
+
+    def pick(self):  # what to do after a run
+        self.go(*random.choices([('stand', random.uniform(1, 3)), ('sit', random.uniform(3, 7)),
+                                 ('look', random.uniform(2, 3.5))], weights=(35, 40, 25))[0])
+
+    def clear_of_clock(self):  # resting behind the clock would hide the fox: it only stops beside it
+        box = self.island.c_text.text_box()
+        return self.x + self.W < box.left() or self.x > box.right()
+
     def step(self):
         r, now = self.island.shape, time.time()
-        lo, hi = r.left() + 12, r.right() - 12 - self.width()
-        if now < self.rest_until:
-            self.frame = 0
-        else:
+        lo, hi = r.left() + 12, r.right() - 12 - self.W
+        if now - self.idle_at >= 2:  # idle time changes slowly: check it every 2 s, not every frame
+            self.idle_at, self.asleep = now, idle_seconds() >= self.island.settings['fox_sleep']
+        asleep = self.asleep
+        if asleep and self.state not in ('sleep', 'run'):
+            self.go('run')  # first find a free spot beside the clock
+        if asleep and self.state == 'run' and self.clear_of_clock():
+            self.go('sleep')
+        elif not asleep and self.state == 'sleep':
+            self.go('wake', 1.6)  # sits up for a moment, then runs again
+        if self.state == 'run':
             self.x += self.dir * 2.2
             self.frame ^= 1
-            if not lo <= self.x <= hi or random.random() < 0.004:  # an end, or now and then a breather
+            if not lo <= self.x <= hi:  # an end: turn around and take a break
                 self.x = min(max(self.x, lo), hi)
-                if self.x in (lo, hi):
-                    self.dir = 1 if self.x == lo else -1
-                self.rest_until, self.frame = now + random.uniform(1.2, 3.5), 0
-        self.move(int(self.x), int(r.center().y() - self.height() / 2 + 2))
+                self.dir = 1 if self.x == lo else -1
+                if not asleep:
+                    self.pick()
+            elif random.random() < 0.006 and self.clear_of_clock() and not asleep:  # now and then a break
+                self.pick()
+        elif self.state != 'sleep' and now >= self.until:
+            self.go('run')
+        elif self.state == 'look' and random.random() < 0.08:
+            self.dir = -self.dir  # glances one way, then the other
+        self.frame = self.frame ^ 1 if self.state in ('sit', 'sleep') and random.random() < 0.35 else self.frame
+        self.x = min(max(self.x, lo), hi)  # the pill may have changed size
+        self.move(int(self.x), int(r.center().y() - self.H / 2 + 2 - self.Z))
+        self.update()
+
+    def rows(self):
+        if self.state == 'run':
+            return FOX_BODY + FOX_LEGS[self.frame]
+        if self.state in ('sit', 'wake'):
+            return FOX_WAG if self.state == 'sit' and self.frame else FOX_SIT
+        if self.state == 'sleep':
+            return FOX_SLEEP
+        return FOX_BODY + FOX_LEGS[0]  # stand, look
+
+    @functools.lru_cache(maxsize=16)
+    def sprite(self, rows, facing):
+        """One pose drawn once into a pixmap; painting is then a single copy instead of ~60 little squares."""
+        pix = QPixmap(self.W, self.H)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        if facing < 0:  # facing left: mirror
+            p.translate(self.W, 0)
+            p.scale(-1, 1)
+        for y, line in enumerate(rows):
+            for x, ch in enumerate(line):
+                if ch != ' ':
+                    p.fillRect(x * self.PX, y * self.PX, self.PX, self.PX, QColor(FOX_COLORS[ch]))
+        p.end()
+        return pix
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        breath = 1 if self.state == 'sleep' and self.frame else 0  # a slow rise and fall while asleep
+        p.drawPixmap(0, self.Z + breath, self.sprite(tuple(self.rows()), self.dir))
+        if self.state == 'sleep':  # three z's drifting up from the head
+            p.setFont(QFont(ROUND, 7, QFont.Bold))
+            head = self.W - 8 if self.dir > 0 else 4
+            for i in range(3):
+                t = (time.time() / 2.4 + i / 3) % 1
+                c = QColor(THEME['lavender'])
+                c.setAlphaF(1 - t)
+                p.setPen(c)
+                p.drawText(QPointF(head + 4 * t + 2 * i, self.Z + 6 - t * (self.Z + 2)), 'z')
+
+
+class Petals(QWidget):
+    """A short sakura drift across the closed pill when the fox comes out; asleep the rest of the time."""
+
+    def __init__(self, island):
+        super().__init__(island)
+        self.island, self.petals = island, []
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.timer = QTimer(self, timeout=self.step, interval=33)
+        self.hide()
+
+    def burst(self, n=7):
+        r = self.island.shape
+        self.setGeometry(r.toAlignedRect())
+        colors = (THEME['sakura'], THEME['lavender'], '#ffd1e6')
+        self.petals = [{'x': r.width() + random.uniform(0, 70), 'y': random.uniform(4, r.height() - 6),
+                        'vx': -random.uniform(0.9, 1.8), 'phase': random.uniform(0, 6.3),
+                        'rot': random.uniform(0, 360), 'spin': random.uniform(-6, 6), 'size': random.uniform(4, 6.5),
+                        'color': random.choice(colors)} for _ in range(n)]
+        self.show()
+        self.timer.start()
+
+    def step(self):
+        self.setGeometry(self.island.shape.toAlignedRect())
+        for pt in self.petals:
+            pt['x'] += pt['vx']
+            pt['phase'] += 0.12
+            pt['y'] += math.sin(pt['phase']) * 0.4
+            pt['rot'] += pt['spin']
+        self.petals = [pt for pt in self.petals if pt['x'] > -10]
+        if not self.petals or not self.island.fox.isVisible():
+            self.timer.stop()
+            self.hide()
         self.update()
 
     def paintEvent(self, e):
         p = QPainter(self)
-        if self.dir < 0:  # running left: mirror
-            p.translate(self.width(), 0)
-            p.scale(-1, 1)
-        for y, line in enumerate(FOX_BODY + FOX_LEGS[self.frame]):
-            for x, ch in enumerate(line):
-                if ch != ' ':
-                    p.fillRect(x * self.PX, y * self.PX, self.PX, self.PX, QColor(FOX_COLORS[ch]))
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), self.height() / 2, self.height() / 2)
+        p.setClipPath(path)  # petals stay inside the pill
+        p.setPen(Qt.NoPen)
+        for pt in self.petals:
+            c = QColor(pt['color'])
+            c.setAlphaF(0.85)
+            p.setBrush(c)
+            p.save()
+            p.translate(pt['x'], pt['y'])
+            p.rotate(pt['rot'])
+            s = pt['size']
+            p.drawEllipse(QRectF(-s / 2, -s / 3, s, s * 0.66))
+            p.restore()
+
+
+class TabBar(QWidget):
+    """Tab icons centred at the top of the open island. The island is centred too, so the icons stay in the
+    same screen spot when it resizes for another tab; a soft sakura pill slides to the active one."""
+
+    def __init__(self, buttons):
+        super().__init__()
+        self.buttons, self.index, self.pos = buttons, -1, 0.0  # pos: the pill's place, in tabs (2.5 = between 2 and 3)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addStretch(1)
+        for b in buttons:
+            lay.addWidget(b)
+        lay.addStretch(1)
+        self.anim = QVariantAnimation(self, duration=260, easingCurve=QEasingCurve.OutCubic)
+        self.anim.valueChanged.connect(lambda v: (setattr(self, 'pos', v), self.update()))
+
+    def select(self, i):
+        if i == self.index:
+            return
+        if self.index < 0:
+            self.pos = float(i)
+        else:  # animate the tab position, not pixels: the bar resizes with the island while the pill slides
+            self.anim.stop()
+            self.anim.setStartValue(self.pos)
+            self.anim.setEndValue(float(i))
+            self.anim.start()
+        self.index = i
+        self.update()
+
+    def paintEvent(self, e):
+        if self.index < 0:
+            return
+        i, f = int(self.pos), self.pos - int(self.pos)
+        a = QRectF(self.buttons[i].geometry())
+        b = QRectF(self.buttons[min(i + 1, len(self.buttons) - 1)].geometry())
+        r = QRectF(a.x() + (b.x() - a.x()) * f, a.y(), a.width(), a.height()).adjusted(2, 1, -2, -1)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(THEME['sakura-tint']))
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
 
 
 class Switch(QAbstractButton):  # macOS-style toggle
@@ -1527,8 +1750,10 @@ class Island(QWidget):
         self.shape = QRectF()
         self.anim = QVariantAnimation(self, duration=550)
         self.anim.valueChanged.connect(self.set_shape)
+        self.anim.finished.connect(self.fit_window)
         load_money()
-        self.money_server, self.money_at, self.flash = None, 0, None  # flash: (text, color, until)
+        self.money_server, self.money_at, self.flash = None, 0, None  # flash: (text, color, until, pill width)
+        self.lang = None  # keyboard language last seen, (native name, label)
         money_last['at'] = 0  # entries loaded from disk are not news
         if not self.settings['phone_key']:
             self.set_setting('phone_key', secrets.token_urlsafe(9))  # pairing key in every phone URL and Shortcut
@@ -1539,10 +1764,23 @@ class Island(QWidget):
         self.tick_timer = QTimer(self, timeout=self.tick, interval=100)
         self.tick_timer.start()
         QTimer(self, timeout=self.stats, interval=1000).start()
+        QTimer(self, timeout=self.check_language, interval=250).start()
         self.stats()
         if FROZEN:  # source runs update with git; the installed .exe checks GitHub a minute after start, then every 6 h
             QTimer.singleShot(60_000, self.check_update)
             QTimer(self, timeout=self.check_update, interval=6 * 3600_000).start()
+
+    def check_language(self):
+        """Pop the keyboard language up on the pill for 1.5 s when it changes (Win+Space, Alt+Shift, IME あ/A)."""
+        try:
+            lang = keyboard_language()
+        except OSError:
+            return
+        if lang and lang != self.lang:
+            if self.lang:  # not on start-up
+                self.flash = (f'{lang[0]}   {lang[1]}', SAKURA, time.time() + 1.5, 200)
+                self.tick()
+            self.lang = lang
 
     def check_update(self):
         def run():
@@ -1567,16 +1805,17 @@ class Island(QWidget):
         self.compact = row(self.c_art, self.c_text, self.c_wave, self.c_timer, spacing=8)
         self.compact.setParent(self)
         self.compact.layout().setContentsMargins(8, 6, 10, 6)  # near-even sides keep the clock centered
+        self.petals = Petals(self)
+        self.petals.stackUnder(self.compact)
         self.fox = Fox(self)
-        self.fox.stackUnder(self.compact)  # the clock stays readable when the fox runs past it
+        self.fox.stackUnder(self.petals)  # order, bottom to top: fox, petals, clock (stays readable)
         self.fox.hide()
         self.compact.layout().setStretch(1, 1)
 
-        # expanded header: date left, tabs right
-        self.f_date = Text(8, DIM)
+        # expanded header: centred tab icons that never move (the date lives in the closed pill)
         self.tab_buttons = [icon_button(g, 10, lambda _=False, t=t: self.set_tab(t))
                             for g, t in zip((MUSIC, LYRICS, SHELF, MONEY, SYSTEM, TIMER, CALENDAR, GEAR), TABS)]
-        header = row(self.f_date, None, *self.tab_buttons, spacing=0)
+        header = self.tab_bar = TabBar(self.tab_buttons)
 
         # media page
         self.f_art = Art(64, 14)
@@ -1724,11 +1963,17 @@ class Island(QWidget):
             box.currentIndexChanged.connect(lambda i: self.set_lyric_option(key, options[i][1]))
             return box
 
+        sleep_box = QComboBox()
+        sleep_box.addItems([label for label, _ in FOX_SLEEP_AFTER])
+        sleep_box.setCurrentIndex(next((i for i, (_, s) in enumerate(FOX_SLEEP_AFTER)
+                                        if s == self.settings['fox_sleep']), 2))
+        sleep_box.currentIndexChanged.connect(lambda i: self.set_setting('fox_sleep', FOX_SLEEP_AFTER[i][1]))
         settings_page = column(
             setting('Start with Windows', Switch(autostart(), autostart)),
             setting('Tiny island in fullscreen apps and games', toggle('tiny_fullscreen')),
             setting('Lyrics in small island', toggle('compact_lyrics')),
             setting('Fox runs in the island when idle', toggle('fox')),
+            setting('Fox sleeps when the PC is untouched for', sleep_box),
             setting('Lyrics translation', choice('translation', TRANSLATIONS)),
             setting('Lyrics pronunciation', choice('pronunciation', PRONUNCIATIONS)),
             setting('Alert sound', toggle('sound')),
@@ -1829,8 +2074,9 @@ class Island(QWidget):
             w, h = TINY
             return QRectF((self.width() - w) / 2, 2, w, h)
         else:
-            busy = self.alert or self.flash or media.get('playing') or self.timer_end
-            w, h = (320 if busy else 190 if self.settings['fox'] else 150), COMPACT_H  # idle: room for the fox
+            busy = self.alert or media.get('playing') or self.timer_end
+            w = self.flash[3] if self.flash else 320 if busy else 290 if self.settings['fox'] else 190  # idle: date + fox
+            h = COMPACT_H
         return QRectF((self.width() - w) / 2, TOP, w, h)
 
     def morph(self):
@@ -1846,7 +2092,17 @@ class Island(QWidget):
         grow = t.height() >= self.shape.height()
         self.anim.setEasingCurve(QEasingCurve.OutBack if grow else QEasingCurve.OutCubic)
         self.anim.setDuration(550 if grow else 380)
+        if t.height() > COMPACT_H + 1:
+            self.fit_window(tall=True)  # room to open before the spring starts
         self.anim.start()
+
+    def fit_window(self, tall=False):
+        """Closed island: the window is only as tall as the pill. Windows redraws the whole transparent window on
+        every frame, so the fox and the sound bars cost a fraction of what an 820 x 430 window would.
+        Only the height changes, so nothing moves sideways."""
+        h = WIN[1] if tall or self.shape.height() > COMPACT_H + 1 else int(TOP + COMPACT_H + 8)
+        if self.height() != h:
+            self.resize(self.width(), h)
 
     def set_shape(self, r):
         self.shape = r
@@ -2034,7 +2290,7 @@ class Island(QWidget):
         if money_last['at']:  # a new transaction from the iPhone, not shown yet
             tx = money_last['tx']
             self.flash = (f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} ฿  ·  {tx["note"] or tx["source"]}',
-                          GREEN if tx['kind'] == 'in' else RED, money_last['at'] + 6)
+                          GREEN if tx['kind'] == 'in' else RED, money_last['at'] + 6, 320)
             money_last['at'] = 0
             self.refresh_money()
         if self.flash and now > self.flash[2]:
@@ -2073,7 +2329,7 @@ class Island(QWidget):
         elif lyric and self.settings['compact_lyrics']:
             self.c_text.set(lyric, self.c_wave.color)
         else:
-            self.c_text.set(title if playing else time.strftime('%H:%M'), FG)
+            self.c_text.set(title if playing else time.strftime('%a %d/%m   %H:%M'), FG)
 
         # fast ticks only while something moves: synced lyrics, the open island, a countdown
         fast = self.expanded or (lyric and self.settings['compact_lyrics'])
@@ -2087,7 +2343,6 @@ class Island(QWidget):
             return
 
         # expanded
-        self.f_date.set(time.strftime('%a %d %b  %H:%M'))
         self.f_title.set(title or 'Nothing playing')
         self.f_artist.set(media.get('artist', ''))
         self.f_lyric.set(lyric)
@@ -2119,6 +2374,8 @@ class Island(QWidget):
             self.pages.setCurrentWidget(self.pages.findChild(QWidget, page))
             for b, t in zip(self.tab_buttons, TABS):
                 b.setStyleSheet(ICON_STYLE.format(color=FG if t == page else FAINT))
+            if page in TABS:
+                self.tab_bar.select(TABS.index(page))
         self.a_text.set(self.alert or '')
         self.morph()
 
