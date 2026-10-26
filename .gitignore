@@ -1,0 +1,7 @@
+build/
+dist/
+__pycache__/
+*.spec
+# personal data (the app keeps it in %APPDATA%\DynamicIsland; older versions kept it here)
+settings.json
+reminders.json

@@ -1,0 +1,45 @@
+name: release
+
+# Push a tag like v1.0.1 (matching VERSION in island.py) to build the installer and publish a release.
+# Installed islands pick it up through auto-update.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Check tag matches VERSION
+        shell: pwsh
+        run: |
+          $v = '${{ github.ref_name }}'.TrimStart('v')
+          if (-not (Select-String -Path island.py -Pattern "^VERSION = '$v'$" -Quiet)) { throw "island.py VERSION is not $v" }
+
+      - name: Self-check
+        run: python island.py test
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: ./build.ps1 -Version ('${{ github.ref_name }}'.TrimStart('v'))
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create ${{ github.ref_name }} (Get-Item dist/DynamicIsland-Setup-*.exe).FullName --title "Dynamic Island ${{ github.ref_name }}" --generate-notes
+        shell: pwsh
