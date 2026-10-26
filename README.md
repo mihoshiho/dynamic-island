@@ -8,8 +8,11 @@ open.
 - **Music**: cover, title, progress and controls for whatever plays, YouTube included.
 - **Lyrics**: time-synced lyrics with romaji and translation side by side.
 - **Shelf**: drop files on the island to keep them, drag them out to use them.
-- **Money**: income and expenses from KBank SMS, emails and slips, sent from your iPhone.
+- **Money**: income and expenses from KBank SMS, emails and slips, sent from your iPhone, by pay cycle, with a
+  calendar and how much you can spend per day until payday.
 - **System**: CPU and RAM graphs, and the programs using the most CPU.
+- **Claude**: your Claude Code usage from its logs on this PC: the 5-hour window (how full, when it resets),
+  today and the last 7 days, with the value at API prices.
 - **Timer** and **Calendar** reminders.
 - **Idle fox**: runs in the island when nothing plays. In fullscreen games the island shrinks to a thin bar.
 

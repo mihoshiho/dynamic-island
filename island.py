@@ -4,7 +4,7 @@ system (CPU/RAM graphs, top programs), timer, calendar reminders.
 Run: pythonw island.py      (right-click the island to quit)
 Self-check: python island.py test
 """
-import asyncio, bisect, collections, ctypes, datetime as dt, faulthandler, functools, json, math, os, pathlib, random, re, sys, threading, time, urllib.parse
+import asyncio, bisect, calendar, collections, ctypes, datetime as dt, faulthandler, functools, json, math, os, pathlib, random, re, sys, threading, time, urllib.parse
 import http.server, ipaddress, secrets, shutil, socket, subprocess, urllib.request, winreg, winsound
 
 import psutil
@@ -38,13 +38,13 @@ MUSIC, SYSTEM, TIMER, CALENDAR = '\uE8D6', '\uE9D9', '\uE916', '\uE787'
 PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
 COMPACT_H, TOP, WIN = 36, 8, (820, 430)
 GEAR, LYRICS = '', ''
-SHELF, MONEY = '', ''
-TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'timer', 'calendar', 'settings']
-SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 250), 'system': (540, 220),
-         'timer': (400, 180), 'calendar': (580, 260), 'settings': (500, 392), 'alert': (400, 160)}
+SHELF, MONEY, CLAUDE = '', '', ''
+TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'claude', 'timer', 'calendar', 'settings']
+SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 250), 'system': (540, 220), 'claude': (700, 220),
+         'timer': (400, 180), 'calendar': (580, 260), 'settings': (520, 416), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.4.0'
+VERSION = '1.0.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -280,16 +280,45 @@ def add_tx(tx, source, raw=''):
         return new
 
 
+PAYDAY = 26  # pay lands on the 26th-28th; with no 💼 Salary entry yet, cycles start on this day
+
+
+def shift_month(d, months):
+    y, m = divmod(d.month - 1 + months, 12)
+    y += d.year
+    return d.replace(year=y, month=m + 1, day=min(d.day, calendar.monthrange(y, m + 1)[1]))
+
+
+def pay_cycle(now):
+    """(start, next payday) as midnights. A cycle starts on the day the latest 💼 Salary came in; without one in
+    the last 40 days, on the PAYDAY. The next payday is counted as the PAYDAY of the next month (the earliest
+    the money comes), so "can spend per day" never assumes money that isn't there yet."""
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    with money_lock:
+        paid = [t['ts'] for t in money if t['kind'] == 'in' and 'Salary' in (t.get('cat') or '')
+                and t['ts'] <= now.timestamp()]
+    if paid and now.timestamp() - max(paid) < 40 * 86400:
+        start = dt.datetime.fromtimestamp(max(paid)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = today.replace(day=PAYDAY) if today.day >= PAYDAY else shift_month(today.replace(day=PAYDAY), -1)
+    return start, shift_month(start.replace(day=PAYDAY), 1)
+
+
 def money_totals(now=None):
     now = dt.datetime.fromtimestamp(now or time.time())
-    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    month0 = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
-    out = {'today_in': 0.0, 'today_out': 0.0, 'month_in': 0.0, 'month_out': 0.0}
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start, payday = pay_cycle(now)
+    out = {'today_in': 0.0, 'today_out': 0.0, 'cycle_in': 0.0, 'cycle_out': 0.0}
     with money_lock:
         for t in money:
-            for start, period in ((day0, 'today'), (month0, 'month')):
-                if t['ts'] >= start:
+            for since, period in ((today.timestamp(), 'today'), (start.timestamp(), 'cycle')):
+                if since <= t['ts'] <= now.timestamp() + 60:
                     out[f'{period}_{t["kind"]}'] += t['amount']
+    days_so_far = (today - start).days + 1
+    days_left = max(1, (payday - today).days)  # today included, payday not
+    out.update(cycle_start=start.timestamp(), payday=payday.timestamp(), days_left=days_left,
+               avg_day=out['cycle_out'] / days_so_far,
+               can_day=max(0.0, out['cycle_in'] - out['cycle_out']) / days_left)
     return out
 
 
@@ -356,7 +385,7 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                 return self.send(200, (FONT_DIR / name).read_bytes(), 'font/ttf')
         if url.path == '/api/tx' and secrets.compare_digest(k, self.key):
             with money_lock:
-                items = [{k2: v for k2, v in t.items() if k2 != 'raw'} for t in money[-300:]]
+                items = [{k2: v for k2, v in t.items() if k2 != 'raw'} for t in money[-2000:]]  # calendar history
             return self.send(200, {'tx': items, 'totals': money_totals()})
         self.send(404, {'error': 'not found'})
 
@@ -484,13 +513,34 @@ code{background:var(--ground);color:var(--sakura);padding:2px 6px;border-radius:
 .danger{color:var(--coral)}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}label{font-size:13px;color:var(--muted)}
 .petal{width:22px;height:22px;flex:none}
+.wide{grid-column:1/-1}.wide>small{display:block;margin-top:8px}
+details.steps{margin-top:24px}summary{cursor:pointer;color:var(--ink);font-weight:700;padding:10px 0;list-style:none}
+summary::-webkit-details-marker{display:none}summary::after{content:'▸';float:right;color:var(--muted)}
+details[open] summary::after{content:'▾'}
+.calbox{background:var(--surface);border-radius:14px;padding:10px}
+.calhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.calhead b{font:500 17px var(--round)}.calhead button{padding:6px 14px;font-size:18px}
+.grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
+.wd{font-size:11px;color:var(--muted);text-align:center;padding-bottom:2px}
+.d{border-radius:10px;min-height:54px;padding:4px 2px;display:flex;flex-direction:column;align-items:center;gap:1px;
+ font-size:10px;line-height:1.2;font-variant-numeric:tabular-nums;overflow:hidden}
+.d .n{font-size:12px;font-weight:700}.d .o{color:var(--coral)}.d .i{color:var(--mint)}
+.d.today{box-shadow:inset 0 0 0 2px var(--sakura)}.d.sel{background:var(--sakura-tint)}
+.d.blank{background:transparent;pointer-events:none}.d.over .o{font-weight:700}
+.d.start .n::after{content:'';display:block;width:4px;height:4px;border-radius:2px;background:var(--mint);margin:1px auto 0}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}</style></head><body>
 <h1><svg class="petal" viewBox="-12 -12 24 24" aria-hidden="true"><g style="fill:var(--sakura)">
 <ellipse rx="4" ry="7" cy="-5"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(72)"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(144)"/>
 <ellipse rx="4" ry="7" cy="-5" transform="rotate(216)"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(288)"/></g>
 <circle r="2.5" style="fill:var(--butter)"/></svg>Money</h1>
 <div class="cards"><div class="card"><small>Today</small><div class="big in" id="ti"></div><div class="big out" id="to"></div></div>
-<div class="card"><small>This month</small><div class="big in" id="mi"></div><div class="big out" id="mo"></div></div></div>
+<div class="card"><small id="cyc">Pay cycle</small><div class="big in" id="mi"></div><div class="big out" id="mo"></div></div>
+<div class="card wide"><div class="row2"><div><small>Avg spent / day</small><div class="big out" id="avg"></div></div>
+<div><small>Can spend / day</small><div class="big in" id="can"></div></div></div><small id="left"></small></div></div>
+<h2>Calendar</h2>
+<div class="calbox"><div class="calhead"><button type="button" id="prev" aria-label="Previous month">‹</button>
+<b id="mon"></b><button type="button" id="next" aria-label="Next month">›</button></div>
+<div class="grid" id="grid"></div></div>
 <h2>Add</h2>
 <form id="f"><input id="amt" inputmode="decimal" placeholder="Amount ฿" required>
 <div class="seg"><button type="button" id="bo" class="on">Out</button><button type="button" id="bi">In</button></div>
@@ -499,7 +549,8 @@ code{background:var(--ground);color:var(--sakura);padding:2px 6px;border-radius:
 <h2>Import slips</h2>
 <button id="pick" style="width:100%">Choose K PLUS slips from Photos</button>
 <input id="files" type="file" accept="image/*" multiple hidden><p class="s" id="st" style="color:var(--muted);margin:8px 4px"></p>
-<h2>History</h2><div id="list"></div>
+<h2 style="display:flex;justify-content:space-between;align-items:center">History
+<button type="button" id="all" class="chip" hidden>Show all</button></h2><div id="list"></div>
 <div class="sheet" id="sheet"><div class="panel">
 <div class="s" id="e_title" style="text-align:center;color:var(--muted);font-size:13px"></div>
 <input class="big" id="e_amt" inputmode="decimal" placeholder="0.00">
@@ -510,7 +561,7 @@ code{background:var(--ground);color:var(--sakura);padding:2px 6px;border-radius:
 <div class="s" id="e_src" style="color:var(--muted);font-size:12px"></div>
 <div class="row2"><button id="e_del" class="danger">Delete</button><button id="e_save" class="primary">Save</button></div>
 <button id="e_close">Cancel</button></div></div>
-<h2>iPhone Shortcuts setup</h2><div class="steps">
+<details class="steps"><summary>iPhone Shortcuts setup</summary>
 <p>Each Shortcut ends with <b>Get Contents of URL</b>: URL <code id="ep"></code>, Method <b>POST</b>,
 Request Body <b>JSON</b> with <code>key</code> = <code>__KEY__</code>, <code>source</code> (below) and
 <code>text</code> = the input.</p>
@@ -522,7 +573,7 @@ Get Contents of URL with <code>source</code> = <code>email</code>, <code>text</c
 Time of Day → Run Immediately → Find Photos (Album is K PLUS, Date Taken is today) → Repeat with Each →
 Extract Text from Image → Get Contents of URL with <code>source</code> = <code>slip</code>, <code>text</code> =
 Extracted Text. Sending a slip twice is harmless: copies are merged.</p>
-<p>Away from home Wi-Fi? Install Tailscale on the PC and the iPhone and use the island's Tailscale address.</p></div>
+<p>Away from home Wi-Fi? Install Tailscale on the PC and the iPhone and use the island's Tailscale address.</p></details>
 <script>
 const K='__KEY__',$=id=>document.getElementById(id);let kind='out',cat='';
 const CATS={out:['🍜 Food','🚆 Transport','🛍️ Shopping','💡 Bills','🎮 Fun','💊 Health','↔️ Transfer','📦 Other'],
@@ -540,15 +591,41 @@ $('bo').onclick=()=>setKind('out');$('bi').onclick=()=>setKind('in');drawCats();
 const post=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,...b})});
 function dayName(d){const t=new Date();t.setHours(0,0,0,0);const x=new Date(d);x.setHours(0,0,0,0);const n=(t-x)/864e5;
  return n==0?'Today':n==1?'Yesterday':d.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric'})}
+let txs=[],tot=null,calMonth=new Date(),selDay=null;calMonth.setDate(1);
+const dkey=d=>d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate();
+const short=n=>n>=1e4?Math.round(n/1e3)+'k':n>=1e3?(n/1e3).toFixed(1)+'k':String(Math.round(n));  // fits a day cell
+const dm=ts=>new Date(ts*1000).toLocaleDateString('en-GB',{day:'numeric',month:'short'});
 async function load(){
  if($('sheet').classList.contains('on'))return;  // don't redraw under an open edit sheet
- const d=await (await fetch('/api/tx?k='+K)).json(),t=d.totals;
+ const d=await (await fetch('/api/tx?k='+K)).json();txs=d.tx;tot=d.totals;const t=tot;
  $('ti').textContent='+'+baht(t.today_in);$('to').textContent='−'+baht(t.today_out);
- $('mi').textContent='+'+baht(t.month_in);$('mo').textContent='−'+baht(t.month_out);
- const L=$('list');L.innerHTML='';
- if(!d.tx.length){L.innerHTML='<div class="list"><div class="empty">Nothing yet</div></div>';return}
+ $('cyc').textContent='Pay cycle · '+dm(t.cycle_start)+' – '+dm(t.payday-86400);
+ $('mi').textContent='+'+baht(t.cycle_in);$('mo').textContent='−'+baht(t.cycle_out);
+ $('avg').textContent=baht(t.avg_day);$('can').textContent=baht(t.can_day);
+ $('left').textContent=`${t.days_left} day${t.days_left==1?'':'s'} until payday (${dm(t.payday)})`;
+ drawCal();drawList()}
+function drawCal(){  // each day: money out (coral) and in (mint); strong when above the cycle's daily average
+ const days={};for(const x of txs){const k=dkey(new Date(x.ts*1000));(days[k]=days[k]||{i:0,o:0})[x.kind=='in'?'i':'o']+=x.amount}
+ $('mon').textContent=calMonth.toLocaleDateString('en-GB',{month:'long',year:'numeric'});
+ const G=$('grid');G.innerHTML=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(w=>`<div class="wd">${w}</div>`).join('');
+ const lead=(calMonth.getDay()+6)%7,n=new Date(calMonth.getFullYear(),calMonth.getMonth()+1,0).getDate();
+ for(let i=0;i<lead;i++)G.insertAdjacentHTML('beforeend','<div class="d blank"></div>');
+ const today=dkey(new Date()),start=tot?dkey(new Date(tot.cycle_start*1000)):'';
+ for(let day=1;day<=n;day++){
+  const date=new Date(calMonth.getFullYear(),calMonth.getMonth(),day),k=dkey(date),v=days[k];
+  const c=document.createElement('button');c.type='button';
+  c.className='d'+(k==today?' today':'')+(k==selDay?' sel':'')+(k==start?' start':'')+(v&&tot&&v.o>tot.avg_day*1.5?' over':'');
+  c.innerHTML=`<span class="n">${day}</span>`+(v&&v.o?`<span class="o">−${short(v.o)}</span>`:'')+(v&&v.i?`<span class="i">+${short(v.i)}</span>`:'');
+  c.onclick=()=>{selDay=selDay==k?null:k;drawCal();drawList()};G.appendChild(c)}}
+$('prev').onclick=()=>{calMonth.setMonth(calMonth.getMonth()-1);drawCal()};
+$('next').onclick=()=>{calMonth.setMonth(calMonth.getMonth()+1);drawCal()};
+$('all').onclick=()=>{selDay=null;drawCal();drawList()};
+function drawList(){
+ const L=$('list');L.innerHTML='';$('all').hidden=!selDay;
+ const shown=txs.filter(x=>!selDay||dkey(new Date(x.ts*1000))==selDay);
+ if(!shown.length){L.innerHTML='<div class="list"><div class="empty">'+(selDay?'Nothing on this day':'Nothing yet')+'</div></div>';return}
  let box=null,day='',sum=0,sumEl=null;
- for(const x of d.tx.slice().reverse()){
+ for(const x of shown.slice().reverse()){
   const when=new Date(x.ts*1000),name=dayName(when);
   if(name!=day){day=name;sum=0;const h=document.createElement('div');h.className='day';
    h.innerHTML='<span></span><span></span>';h.firstChild.textContent=name;sumEl=h.lastChild;L.appendChild(h);
@@ -633,6 +710,119 @@ def start_money_server(key, icon):
     server = http.server.ThreadingHTTPServer(('0.0.0.0', MONEY_PORT), MoneyHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+# ---------- Claude Code usage, from its own logs on this PC ----------
+CLAUDE_DIR = pathlib.Path.home() / '.claude' / 'projects'
+# $ per million tokens: input, output, cache read. Cache writes cost 1.25x input (5 min) and 2x input (1 h);
+# fast mode doubles everything. shortcut: a fixed table of Anthropic API prices (October 2026); a model it doesn't
+# know still counts its tokens but adds no $. Add new models here.
+CLAUDE_PRICES = {'claude-fable-5-1': (10, 50, 0.25), 'claude-mythos-5-1': (10, 50, 0.25), 'claude-fable-5': (10, 50, 1.0),
+                 'claude-opus-5-5': (4, 20, 0.20), 'claude-opus-5': (5, 25, 0.50), 'claude-opus-4-8': (5, 25, 0.50),
+                 'claude-opus-4-7': (5, 25, 0.50), 'claude-opus-4-6': (5, 25, 0.50), 'claude-sonnet-5-5': (2, 10, 0.20),
+                 'claude-sonnet-5': (2, 10, 0.20), 'claude-sonnet-4-6': (3, 15, 0.30), 'claude-haiku-5-5': (0.1, 0.5, 0.01),
+                 'claude-haiku-4-5': (1, 5, 0.10)}
+WINDOW = 5 * 3600  # Claude plans count usage in 5-hour windows that start with the first message
+
+
+def claude_price(model):
+    key = max((k for k in CLAUDE_PRICES if model.startswith(k)), key=len, default=None)  # 'claude-opus-5' vs '-5-5'
+    return CLAUDE_PRICES.get(key)
+
+
+def message_cost(model, u, speed=None):
+    """(tokens, $) of one reply's usage block."""
+    c = u.get('cache_creation') or {}
+    write_1h = c.get('ephemeral_1h_input_tokens', 0)
+    write_5m = c.get('ephemeral_5m_input_tokens', u.get('cache_creation_input_tokens', 0) - write_1h)
+    tokens = (u.get('input_tokens', 0) + u.get('output_tokens', 0) + u.get('cache_read_input_tokens', 0)
+              + write_5m + write_1h)
+    price = claude_price(model)
+    if not price:
+        return tokens, 0.0
+    inp, out, read = price
+    cost = (u.get('input_tokens', 0) * inp + write_5m * inp * 1.25 + write_1h * inp * 2
+            + u.get('cache_read_input_tokens', 0) * read + u.get('output_tokens', 0) * out) / 1e6
+    return tokens, cost * (2 if (speed or u.get('speed')) == 'fast' else 1)
+
+
+class ClaudeUsage:
+    """Reads Claude Code's session logs (~/.claude/projects/**/*.jsonl). After the first read, only the lines
+    added since last time; one entry per reply (the logs repeat a reply as it streams)."""
+
+    def __init__(self, folder=CLAUDE_DIR):
+        self.folder, self.offsets, self.replies = folder, {}, {}  # reply id -> (time, tokens, $)
+
+    def scan(self, pause=0.0):
+        for f in self.folder.glob('**/*.jsonl'):
+            try:
+                size, start = f.stat().st_size, self.offsets.get(f, 0)
+                if size < start:  # rewritten: read again
+                    start = 0
+                if size == start:
+                    continue
+                with open(f, 'rb') as fh:
+                    fh.seek(start)
+                    data = fh.read()
+            except OSError:
+                continue
+            end = data.rfind(b'\n') + 1  # a half-written last line waits for next time
+            self.offsets[f] = start + end
+            for line in data[:end].splitlines():
+                self.add(line)
+            time.sleep(pause)  # let the island breathe during the first big read
+
+    def add(self, line):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            return
+        m = d.get('message')
+        if not isinstance(m, dict) or not m.get('usage') or not d.get('timestamp'):
+            return
+        ts = dt.datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')).timestamp()
+        tokens, cost = message_cost(m.get('model') or '', m['usage'])
+        self.replies[m.get('id') or d.get('requestId') or d.get('uuid')] = (ts, tokens, cost)
+
+    def summary(self, now=None):
+        now = now or time.time()
+        blocks = []  # [start, end, tokens, $] per 5-hour window
+        for ts, tokens, cost in sorted(self.replies.values()):
+            if not blocks or ts >= blocks[-1][1]:
+                start = ts - ts % 3600  # windows start on the hour of their first message
+                blocks.append([start, start + WINDOW, 0, 0.0])
+            blocks[-1][2] += tokens
+            blocks[-1][3] += cost
+        cur = blocks[-1] if blocks and blocks[-1][1] > now else None
+        past = blocks[:-1] if cur else blocks
+        peak = max((b[3] for b in past), default=0.0)
+        today = dt.datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+        days = [0.0] * 7  # $ per day, oldest first, today last
+        week = [0, 0.0]
+        for ts, tokens, cost in self.replies.values():
+            ago = (today - dt.datetime.fromtimestamp(ts).replace(hour=0, minute=0, second=0, microsecond=0)).days
+            if 0 <= ago < 7:
+                days[6 - ago] += cost
+                week[0] += tokens
+                week[1] += cost
+        today_tokens = sum(t for ts, t, _ in self.replies.values() if ts >= today.timestamp())
+        return {'window_end': cur[1] if cur else None, 'window_tokens': cur[2] if cur else 0,
+                'window_cost': cur[3] if cur else 0.0, 'peak_cost': peak,
+                'pct': (cur[3] / peak if cur and peak else None), 'today_cost': days[6], 'today_tokens': today_tokens,
+                'week_cost': week[1], 'week_tokens': week[0], 'days': days}
+
+
+claude_usage = {}  # latest summary, written by the usage thread
+
+
+def watch_claude():
+    usage, first = ClaudeUsage(), True
+    while True:
+        usage.scan(pause=0.05 if first else 0)
+        first = False
+        claude_usage.clear()
+        claude_usage.update(usage.summary())
+        time.sleep(60)
 
 
 def icon_png(size=180):
@@ -1061,7 +1251,9 @@ class Text(QWidget):  # one elided line; a QLabel would widen the island on long
         text = self.shown(self.text, self.width())
         if self.backdrop and text:
             box = p.boundingRect(self.rect(), self.align | Qt.AlignVCenter, text).adjusted(-6, -4, 6, 4)
-            p.fillRect(box, QColor(BG))
+            veil = QColor(BG)
+            veil.setAlphaF(0.55)  # half see-through: the fox and petals show faintly, the text stays readable
+            p.fillRect(box, veil)
         p.setPen(self.color)
         p.drawText(self.rect(), self.align | Qt.AlignVCenter, text)
 
@@ -1586,6 +1778,73 @@ class Petals(QWidget):
             p.restore()
 
 
+class UsageRing(QWidget):
+    """The current 5-hour Claude window as a ring: how full it is next to your heaviest window so far."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(116, 124)
+        self.pct = None
+
+    def set(self, pct):
+        if pct != self.pct:
+            self.pct = pct
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(10, 6, 96, 96)
+        p.setPen(QPen(QColor(LINE), 9, Qt.SolidLine, Qt.RoundCap))
+        p.drawEllipse(r)
+        if self.pct:
+            color = ORANGE if self.pct >= 0.9 else SAKURA  # nearly as heavy as your biggest window: fox orange
+            p.setPen(QPen(QColor(color), 9, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(r, 90 * 16, -int(min(self.pct, 1) * 360 * 16))
+        p.setPen(QColor(FG))
+        p.setFont(QFont(ROUND, 17, QFont.Bold))
+        p.drawText(r, Qt.AlignCenter, f'{self.pct:.0%}' if self.pct is not None else '–')
+        p.setPen(QColor(DIM))
+        p.setFont(QFont(FONT, 7))
+        p.drawText(QRectF(0, 106, self.width(), 16), Qt.AlignCenter,
+                   'of your biggest window' if self.pct is not None else 'no window running')
+
+
+class DayBars(QWidget):
+    """$ value per day for the last 7 days, today last and in sakura."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(110)
+        self.values = [0.0] * 7
+
+    def set(self, values):
+        if values != self.values:
+            self.values = list(values)
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        top = max(self.values) or 1
+        w, h, base = self.width(), self.height(), self.height() - 16
+        slot = w / 7
+        today = dt.date.today()
+        for i, v in enumerate(self.values):
+            bh = max(3.0, (base - 14) * v / top)
+            x = i * slot + slot * 0.22
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(SAKURA if i == 6 else PURPLE if v else LINE))
+            p.drawRoundedRect(QRectF(x, base - bh, slot * 0.56, bh), 4, 4)
+            day = today - dt.timedelta(days=6 - i)
+            p.setPen(QColor(FG if i == 6 else DIM))
+            p.setFont(QFont(FONT, 7))
+            p.drawText(QRectF(i * slot, base + 2, slot, 14), Qt.AlignCenter, day.strftime('%a')[:2])
+            if i == 6 and v:
+                p.setPen(QColor(SAKURA))
+                p.drawText(QRectF(i * slot - 10, base - bh - 14, slot + 20, 12), Qt.AlignCenter, f'${v:.0f}')
+
+
 class TabBar(QWidget):
     """Tab icons centred at the top of the open island. The island is centred too, so the icons stay in the
     same screen spot when it resizes for another tab; a soft sakura pill slides to the active one."""
@@ -1754,6 +2013,7 @@ class Island(QWidget):
         load_money()
         self.money_server, self.money_at, self.flash = None, 0, None  # flash: (text, color, until, pill width)
         self.lang = None  # keyboard language last seen, (native name, label)
+        self.claude_end = None  # end of the running 5-hour Claude window, to flash when it resets
         money_last['at'] = 0  # entries loaded from disk are not news
         if not self.settings['phone_key']:
             self.set_setting('phone_key', secrets.token_urlsafe(9))  # pairing key in every phone URL and Shortcut
@@ -1814,7 +2074,7 @@ class Island(QWidget):
 
         # expanded header: centred tab icons that never move (the date lives in the closed pill)
         self.tab_buttons = [icon_button(g, 10, lambda _=False, t=t: self.set_tab(t))
-                            for g, t in zip((MUSIC, LYRICS, SHELF, MONEY, SYSTEM, TIMER, CALENDAR, GEAR), TABS)]
+                            for g, t in zip((MUSIC, LYRICS, SHELF, MONEY, SYSTEM, CLAUDE, TIMER, CALENDAR, GEAR), TABS)]
         header = self.tab_bar = TabBar(self.tab_buttons)
 
         # media page
@@ -1867,7 +2127,8 @@ class Island(QWidget):
         # money page: today / month totals, latest entries, phone link
         self.m_totals = [Text(14, c, bold=True, family=ROUND) for c in (GREEN, RED, GREEN, RED)]
         heads = []
-        for label in ('TODAY', 'THIS MONTH'):
+        self.m_budget = Text(9, DIM)
+        for label in ('TODAY', 'PAY CYCLE'):
             heads.append(Text(8, DIM))
             heads[-1].set(label)
         for w in self.m_totals + heads:  # Text has no natural width; without this the list squeezes them to 0
@@ -1883,9 +2144,19 @@ class Island(QWidget):
             row(column(heads[0], self.m_totals[0], self.m_totals[1], spacing=0),
                 column(heads[1], self.m_totals[2], self.m_totals[3], spacing=0),
                 column(*(row(*r, spacing=6) for r in self.m_rows), None, spacing=2), spacing=18),
-            None, row(self.m_link, self.b_phone, self.b_open, spacing=6), spacing=6)
+            self.m_budget, None, row(self.m_link, self.b_phone, self.b_open, spacing=6), spacing=6)
         money_page.layout().itemAt(0).widget().layout().setStretch(2, 1)
-        money_page.layout().itemAt(2).widget().layout().setStretch(0, 1)
+        money_page.layout().itemAt(3).widget().layout().setStretch(0, 1)
+
+        # claude page: 5-hour window ring | reset, today, week | last 7 days
+        self.u_ring, self.u_bars = UsageRing(), DayBars()
+        self.u_reset, self.u_window = Text(13, FG, bold=True, family=ROUND), Text(9, DIM)
+        self.u_today, self.u_week, self.u_note = Text(10), Text(10), Text(7, FAINT)
+        self.u_note.set('Estimate from Claude Code logs, at API prices')
+        self.u_bars.setFixedWidth(200)
+        claude_page = row(self.u_ring, column(self.u_reset, self.u_window, None, self.u_today, self.u_week, self.u_note,
+                                              spacing=3), self.u_bars, spacing=16)
+        claude_page.layout().setStretch(1, 1)
 
         # system page: graphs | top programs
         self.g_cpu, self.g_ram = Graph('CPU', BLUE), Graph('RAM', PURPLE)
@@ -1973,7 +2244,7 @@ class Island(QWidget):
             setting('Tiny island in fullscreen apps and games', toggle('tiny_fullscreen')),
             setting('Lyrics in small island', toggle('compact_lyrics')),
             setting('Fox runs in the island when idle', toggle('fox')),
-            setting('Fox sleeps when the PC is untouched for', sleep_box),
+            setting('Fox sleeps after the PC is idle for', sleep_box),
             setting('Lyrics translation', choice('translation', TRANSLATIONS)),
             setting('Lyrics pronunciation', choice('pronunciation', PRONUNCIATIONS)),
             setting('Alert sound', toggle('sound')),
@@ -1988,7 +2259,8 @@ class Island(QWidget):
                             spacing=12)
 
         self.pages = QStackedWidget()
-        for name, page in zip(TABS + ['alert'], (media_page, lyrics_page, shelf_page, money_page, system_page, timer_page,
+        for name, page in zip(TABS + ['alert'], (media_page, lyrics_page, shelf_page, money_page, system_page, claude_page,
+                                                 timer_page,
                                                  calendar_page,
                                                  settings_page, alert_page)):
             page.setObjectName(name)
@@ -2045,7 +2317,9 @@ class Island(QWidget):
 
     def refresh_money(self):
         t = money_totals()
-        for w, v, sign in zip(self.m_totals, (t['today_in'], t['today_out'], t['month_in'], t['month_out']),
+        self.m_budget.set(f'Avg spent {t["avg_day"]:,.0f} ฿/day   ·   can spend {t["can_day"]:,.0f} ฿/day   ·   '
+                          f'payday in {t["days_left"]} day{"s" * (t["days_left"] != 1)}')
+        for w, v, sign in zip(self.m_totals, (t['today_in'], t['today_out'], t['cycle_in'], t['cycle_out']),
                               '+−+−'):
             w.set(f'{sign}{v:,.2f} ฿')
         with money_lock:
@@ -2055,6 +2329,23 @@ class Island(QWidget):
             note.set(' · '.join(filter(None, (tx.get('cat'), tx['note']))) or tx['source'] if tx else '')
             amount.set(f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} ฿' if tx else '',
                        (GREEN if tx['kind'] == 'in' else RED) if tx else None)
+
+    def refresh_claude(self, now):
+        u = claude_usage
+        if not u:
+            self.u_reset.set('Reading Claude Code logs…')
+            return
+        self.u_ring.set(u['pct'])
+        if u['window_end']:
+            left = max(0, int(u['window_end'] - now))
+            self.u_reset.set(f'Resets in {left // 3600} h {left % 3600 // 60:02d} min')
+            self.u_window.set(f'This window ≈ ${u["window_cost"]:,.2f} of ${u["peak_cost"]:,.0f} biggest')
+        else:
+            self.u_reset.set('No 5-hour window running')
+            self.u_window.set('It starts with your next Claude Code message')
+        self.u_today.set(f'Today ≈ ${u["today_cost"]:,.2f}   ·   {u["today_tokens"] / 1e6:,.1f}M tokens')
+        self.u_week.set(f'Last 7 days ≈ ${u["week_cost"]:,.2f}   ·   {u["week_tokens"] / 1e6:,.1f}M tokens')
+        self.u_bars.set(u['days'])
 
     def request_sync(self):
         key, vid, plain = (media.get('title'), media.get('artist')), media.get('video_id'), media.get('plain')
@@ -2293,6 +2584,12 @@ class Island(QWidget):
                           GREEN if tx['kind'] == 'in' else RED, money_last['at'] + 6, 320)
             money_last['at'] = 0
             self.refresh_money()
+        end = claude_usage.get('window_end')
+        if self.claude_end and now >= self.claude_end:  # the 5-hour Claude window just ran out: a fresh one is ready
+            self.flash = ('Claude usage window reset', SAKURA, now + 4, 260)
+            self.claude_end = None
+        elif end and end > now:
+            self.claude_end = end
         if self.flash and now > self.flash[2]:
             self.flash = None
 
@@ -2346,6 +2643,8 @@ class Island(QWidget):
         self.f_title.set(title or 'Nothing playing')
         self.f_artist.set(media.get('artist', ''))
         self.f_lyric.set(lyric)
+        if page == 'claude':
+            self.refresh_claude(now)
         if page == 'money' and now - self.money_at > 2:  # totals change slowly
             self.money_at = now
             self.refresh_money()
@@ -2423,8 +2722,32 @@ def selftest():
     b = add_tx({**sms_in, 'ts': when + 60}, 'slip')  # same transfer reported twice: merged
     assert a is b and a['source'] == 'sms+slip' and len(money) == 1
     money.clear()
+    d = dt.datetime
+    assert pay_cycle(d(2026, 10, 20, 12)) == (d(2026, 9, 26), d(2026, 10, 26))  # no salary yet: the 26th
+    assert pay_cycle(d(2026, 10, 27, 9)) == (d(2026, 10, 26), d(2026, 11, 26))
+    money.append({'id': 's', 'ts': d(2026, 10, 28, 10).timestamp(), 'amount': 30000.0, 'kind': 'in',
+                  'cat': '💼 Salary', 'note': '', 'source': 'manual'})
+    assert pay_cycle(d(2026, 11, 2)) == (d(2026, 10, 28), d(2026, 11, 26))  # paid on the 28th: cycle from then
+    money.append({'id': 'f', 'ts': d(2026, 11, 2, 12).timestamp(), 'amount': 400.0, 'kind': 'out', 'cat': '',
+                  'note': '', 'source': 'manual'})
+    t = money_totals(d(2026, 11, 2, 18).timestamp())
+    assert t['cycle_out'] == 400 and t['days_left'] == 24 and round(t['avg_day']) == 67  # 400 over 6 days
+    assert round(t['can_day'], 2) == round(29600 / 24, 2)
+    money.clear()
     MONEY_FILE.unlink(missing_ok=True)
     MONEY_FILE = saved_file
+    u = {'input_tokens': 1_000_000, 'output_tokens': 1_000_000, 'cache_read_input_tokens': 1_000_000,
+         'cache_creation_input_tokens': 2_000_000, 'cache_creation': {'ephemeral_1h_input_tokens': 1_000_000,
+                                                                      'ephemeral_5m_input_tokens': 1_000_000}}
+    assert message_cost('claude-opus-5-5', u) == (5_000_000, 4 + 20 + 0.20 + 4 * 1.25 + 4 * 2)  # 37.2 $
+    assert claude_price('claude-opus-5') == (5, 25, 0.50) and claude_price('claude-opus-5-5[1m]') == (4, 20, 0.20)
+    assert message_cost('<synthetic>', u)[1] == 0
+    usage = ClaudeUsage(pathlib.Path(os.environ.get('TEMP', '.')) / 'no-such-claude-dir')
+    base = dt.datetime(2026, 10, 27, 9, 20).timestamp()
+    usage.replies = {'a': (base - 6 * 3600, 10, 4.0), 'b': (base - 5.5 * 3600, 10, 6.0),  # an earlier window: $10
+                     'c': (base, 10, 2.0), 'd': (base + 600, 10, 3.0)}  # the current one: started 09:00, $5
+    s = usage.summary(base + 900)
+    assert s['window_end'] == dt.datetime(2026, 10, 27, 14, 0).timestamp() and s['pct'] == 0.5, s
     print('ok')
 
 
@@ -2436,6 +2759,7 @@ if __name__ == '__main__':
         prefs.update(lang=_s['translation'], romaji=bool(_s['pronunciation']))
         threading.Thread(target=lambda: asyncio.run(media_loop()), daemon=True).start()
         threading.Thread(target=scan_processes, daemon=True).start()
+        threading.Thread(target=watch_claude, daemon=True).start()
         app = QApplication(sys.argv)
         app.setStyleSheet(STYLE)
         island = Island()
