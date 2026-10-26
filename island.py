@@ -4,7 +4,7 @@ system (CPU/RAM graphs, top programs), timer, calendar reminders.
 Run: pythonw island.py      (right-click the island to quit)
 Self-check: python island.py test
 """
-import asyncio, bisect, collections, ctypes, datetime as dt, json, os, pathlib, random, re, sys, threading, time, urllib.parse
+import asyncio, bisect, collections, ctypes, datetime as dt, faulthandler, json, os, pathlib, random, re, sys, threading, time, urllib.parse
 import shutil, subprocess, urllib.request, winreg, winsound
 
 import psutil
@@ -28,7 +28,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'system': (540, 220), 'timer
          'calendar': (580, 260), 'settings': (460, 300), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -39,6 +39,11 @@ for _name in ('reminders.json', 'settings.json'):  # move data from older versio
         shutil.move(_old, DATA / _name)  # script may sit on another drive than AppData
 SAVE = DATA / 'reminders.json'
 SETTINGS_FILE = DATA / 'settings.json'
+if FROZEN:  # a windowed .exe has no console: keep errors in a file so bugs can be traced
+    _log = open(DATA / 'error.log', 'a', encoding='utf-8', buffering=1)
+    sys.stderr = _log
+    faulthandler.enable(_log)
+    threading.excepthook = lambda a: sys.excepthook(a.exc_type, a.exc_value, a.exc_traceback)
 DEFAULTS = {'tiny_fullscreen': True, 'compact_lyrics': True, 'sound': True, 'screen': 0,
             'translation': None, 'pronunciation': None, 'auto_update': True}
 TRANSLATIONS = [('Off', None), ('ไทย', 'th'), ('English', 'en'), ('日本語', 'ja')]
@@ -897,7 +902,6 @@ class Island(QWidget):
         self.shape = QRectF()
         self.anim = QVariantAnimation(self, duration=550)
         self.anim.valueChanged.connect(self.set_shape)
-        self.anim.finished.connect(lambda: self.setMask(self.shape.toAlignedRect()))
         self.build()
         self.shape = self.target()
         self.morph()
@@ -1128,8 +1132,6 @@ class Island(QWidget):
         grow = t.height() >= self.shape.height()
         self.anim.setEasingCurve(QEasingCurve.OutBack if grow else QEasingCurve.OutCubic)
         self.anim.setDuration(550 if grow else 380)
-        # one mask for the whole animation (room for the spring overshoot) instead of a new one every frame
-        self.setMask(self.shape.united(t).adjusted(-30, 0, 30, 30).toAlignedRect())
         self.anim.start()
 
     def set_shape(self, r):
@@ -1140,8 +1142,8 @@ class Island(QWidget):
         self.f_fx.setOpacity(max(0.0, k * 2 - 1) if self.expanded else 0)
         self.compact.setVisible(k < 0.25 and r.height() > COMPACT_H - 8)  # hidden in the tiny pill
         self.full.setVisible(self.expanded and k > 0.5)
-        if self.anim.state() != QVariantAnimation.Running:  # mid-animation mask is set once in morph
-            self.setMask(r.toAlignedRect())  # clicks outside the pill reach the windows below
+        # no setMask: the window is layered, so its transparent pixels already let clicks through, and changing
+        # the window region left the old pixels behind as a square black box until the next full repaint
         self.update()
 
     def paintEvent(self, e):
@@ -1377,7 +1379,6 @@ def selftest():
     media.clear()
     assert mmss(125.7) == '2:05' and mmss(-3) == '0:00'
     assert snapshot()[os.getpid()][0].lower().startswith('python')
-    assert single_instance()  # first holder of the mutex in this process
     print('ok')
 
 
