@@ -1,4 +1,4 @@
-﻿"""Dynamic Island for Windows, macOS style. Tabs: music (album art, synced lyrics, controls),
+"""Dynamic Island for Windows, macOS style. Tabs: music (album art, synced lyrics, controls),
 system (CPU/RAM graphs, top programs), timer, calendar reminders.
 
 Run: pythonw island.py      (right-click the island to quit)
@@ -21,14 +21,14 @@ FONT = 'Segoe UI'
 PREV, PLAY, PAUSE, NEXT = '\uE892', '\uE768', '\uE769', '\uE893'
 MUSIC, SYSTEM, TIMER, CALENDAR = '\uE8D6', '\uE9D9', '\uE916', '\uE787'
 PLAYING = 4  # GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
-COMPACT_H, TOP, WIN = 36, 8, (760, 360)
+COMPACT_H, TOP, WIN = 36, 8, (820, 360)
 GEAR, LYRICS = '', ''
 TABS = ['music', 'lyrics', 'system', 'timer', 'calendar', 'settings']
 SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'system': (540, 220), 'timer': (400, 180),
          'calendar': (580, 260), 'settings': (460, 300), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -646,7 +646,6 @@ class Lyrics(QWidget):
         self.rows = []  # which extra rows this song has: 'pron', 'trans'
         self.fonts = {'big': QFont(FONT, 13, QFont.Bold), 'small': QFont(FONT, 11), 'tiny': QFont(FONT, 9),
                       'romaji': QFont(FONT, 12, QFont.DemiBold), 'romaji_now': QFont(FONT, 13, QFont.Bold)}
-        self.metrics = {k: QFontMetricsF(f) for k, f in self.fonts.items()}
         self.elided = {}  # (text, font, width) -> elided text; measuring every frame was most of the paint cost
         self.cur = None  # current line's layout: (idx, width, font, text, cumulative letter widths)
         self.cur_rect = QRect()
@@ -668,10 +667,16 @@ class Lyrics(QWidget):
         self.elided.clear()
         self.cur = None
 
-    def elide(self, text, font, width):
+    def fit(self, text, font, width, min_pt=8):
+        """(font, text) that fits the width: shrink first so the whole line stays readable, cut only past min_pt."""
         key = (text, font, int(width))
         if key not in self.elided:
-            self.elided[key] = self.metrics[font].elidedText(text, Qt.ElideRight, width)
+            f = QFont(self.fonts[font])
+            fm = QFontMetricsF(f)
+            while f.pointSize() > min_pt and fm.horizontalAdvance(text) > width:
+                f.setPointSize(f.pointSize() - 1)
+                fm = QFontMetricsF(f)
+            self.elided[key] = (f, fm.elidedText(text, Qt.ElideRight, width))
         return self.elided[key]
 
     def block_h(self):  # both columns share a row per lyric line; romaji + translation need more height
@@ -715,7 +720,7 @@ class Lyrics(QWidget):
             p.drawText(self.rect(), Qt.AlignCenter, 'No synced lyrics for this song')
             return
         # split view: original on the left, romaji / translation on the right, same row per line
-        split = w * 0.5 if self.rows else w
+        split = w * 0.42 if self.rows else w  # romaji runs about twice as long as the Japanese it spells
         if self.rows:
             div = QColor(FG)
             div.setAlphaF(0.12)
@@ -740,8 +745,9 @@ class Lyrics(QWidget):
                 c = QColor(FG)
                 c.setAlphaF(fade)
                 p.setPen(c)
-                p.setFont(self.fonts['small'])
-                p.drawText(box, Qt.AlignCenter, self.elide(line[1] or '♪', 'small', box.width()))
+                font, text = self.fit(line[1] or '♪', 'small', box.width())
+                p.setFont(font)
+                p.drawText(box, Qt.AlignCenter, text)
             # right column: romaji big and in the song's color (easiest to read along), translation small below
             texts = [(row, t) for row in self.rows if (t := self.extra(line, row))]
             heights = [22 if row == 'pron' else self.EXTRA_H for row, _ in texts]
@@ -751,9 +757,9 @@ class Lyrics(QWidget):
                 c = QColor(self.color if row == 'pron' else FG if current else DIM)
                 c.setAlphaF(1 if current else fade * (1.6 if row == 'pron' else 1))
                 p.setPen(c)
-                p.setFont(self.fonts[font])
-                p.drawText(QRectF(right_x, top, right_w, h), Qt.AlignLeft | Qt.AlignVCenter,
-                           self.elide(text, font, right_w))
+                qfont, text = self.fit(text, font, right_w)
+                p.setFont(qfont)
+                p.drawText(QRectF(right_x, top, right_w, h), Qt.AlignLeft | Qt.AlignVCenter, text)
                 top += h
 
     def paint_current(self, p, line, r):
@@ -1117,7 +1123,7 @@ class Island(QWidget):
         if self.expanded:
             w, h = SIZES[self.page()]
             if self.page() == 'lyrics' and self.lyrics.rows:  # split view needs the width
-                w, h = 720, h + 14 * len(self.lyrics.rows)
+                w, h = 780, h + 14 * len(self.lyrics.rows)
         elif self.tiny and not self.alert:
             w, h = TINY
             return QRectF((self.width() - w) / 2, 2, w, h)
