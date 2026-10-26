@@ -44,7 +44,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money'
          'timer': (400, 180), 'calendar': (580, 260), 'settings': (520, 416), 'alert': (400, 160)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -301,7 +301,8 @@ def pay_cycle(now):
         start = dt.datetime.fromtimestamp(max(paid)).replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         start = today.replace(day=PAYDAY) if today.day >= PAYDAY else shift_month(today.replace(day=PAYDAY), -1)
-    return start, shift_month(start.replace(day=PAYDAY), 1)
+    # pay is late (past the 26th, no new Salary yet): payday is tomorrow, never a day already gone
+    return start, max(shift_month(start.replace(day=PAYDAY), 1), today + dt.timedelta(days=1))
 
 
 def money_totals(now=None):
@@ -682,7 +683,7 @@ $('files').onchange=async()=>{  // read each slip, show it for checking, save on
 $('f').onsubmit=async e=>{e.preventDefault();
  await post('/api/tx',{amount:$('amt').value.replace(/,/g,''),kind,cat,note:$('note').value,source:'manual'});
  $('amt').value='';$('note').value='';cat='';drawCats();load()};
-load();setInterval(load,5000);
+load();setInterval(load,30000);  // own changes reload at once; the poll only catches SMS/emails
 </script></body></html>'''
 
 
@@ -773,15 +774,15 @@ class ClaudeUsage:
             time.sleep(pause)  # let the island breathe during the first big read
 
     def add(self, line):
-        try:
+        try:  # one odd line must not stop the reader thread
             d = json.loads(line)
-        except ValueError:
+            m = d.get('message')
+            if not isinstance(m, dict) or not m.get('usage') or not d.get('timestamp'):
+                return
+            ts = dt.datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')).timestamp()
+            tokens, cost = message_cost(m.get('model') or '', m['usage'])
+        except (ValueError, TypeError, AttributeError):
             return
-        m = d.get('message')
-        if not isinstance(m, dict) or not m.get('usage') or not d.get('timestamp'):
-            return
-        ts = dt.datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')).timestamp()
-        tokens, cost = message_cost(m.get('model') or '', m['usage'])
         self.replies[m.get('id') or d.get('requestId') or d.get('uuid')] = (ts, tokens, cost)
 
     def summary(self, now=None):
@@ -820,8 +821,7 @@ def watch_claude():
     while True:
         usage.scan(pause=0.05 if first else 0)
         first = False
-        claude_usage.clear()
-        claude_usage.update(usage.summary())
+        claude_usage.update(usage.summary())  # same keys every time: no clear(), so readers never see it empty
         time.sleep(60)
 
 
@@ -2728,6 +2728,11 @@ def selftest():
     money.append({'id': 's', 'ts': d(2026, 10, 28, 10).timestamp(), 'amount': 30000.0, 'kind': 'in',
                   'cat': '💼 Salary', 'note': '', 'source': 'manual'})
     assert pay_cycle(d(2026, 11, 2)) == (d(2026, 10, 28), d(2026, 11, 26))  # paid on the 28th: cycle from then
+    assert pay_cycle(d(2026, 11, 27, 9)) == (d(2026, 10, 28), d(2026, 11, 28))  # pay late: payday tomorrow, not past
+    usage = ClaudeUsage()
+    for bad in (b'"text"', b'[1]', b'{"message": {"usage": {"output_tokens": 5}}, "timestamp": "not a time"}'):
+        usage.add(bad)  # ignored, no error
+    assert not usage.replies
     money.append({'id': 'f', 'ts': d(2026, 11, 2, 12).timestamp(), 'amount': 400.0, 'kind': 'out', 'cat': '',
                   'note': '', 'source': 'manual'})
     t = money_totals(d(2026, 11, 2, 18).timestamp())
