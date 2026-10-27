@@ -9,7 +9,7 @@ import http.server, ipaddress, secrets, shutil, socket, subprocess, urllib.reque
 
 import psutil
 import segno
-from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
+from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QLocale, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
                             QVariantAnimation, QEasingCurve)
 from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRegion, QTextCharFormat
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QFileIconProvider,
@@ -41,12 +41,12 @@ COMPACT_H, TOP, WIN = 36, 8, (820, 470)
 GEAR, LYRICS = '', ''
 SHELF, MONEY, CLAUDE = '', '', ''
 TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'claude', 'timer', 'calendar', 'settings']
-SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 250), 'system': (540, 220), 'claude': (700, 220),
-         'timer': (400, 180), 'calendar': (580, 260), 'settings': (800, 350), 'alert': (400, 160),
+SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 392), 'system': (540, 220), 'claude': (700, 220),
+         'timer': (400, 180), 'calendar': (620, 284), 'settings': (800, 350), 'alert': (400, 160),
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.2.1'
+VERSION = '1.3.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -259,6 +259,8 @@ def load_money():
         money[:] = json.loads(MONEY_FILE.read_text('utf-8'))
     except (OSError, ValueError):
         money[:] = []
+    for t in money:  # older versions named entries after the bank
+        t['note'] = {'KBank slip': 'Slip', 'KBank': 'SMS'}.get(t.get('note'), t.get('note', ''))
     try:
         money_deleted.update(json.loads(DELETED_FILE.read_text('utf-8')))
     except (OSError, ValueError):
@@ -452,7 +454,7 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                 return self.send(422, {'error': 'no amount found', 'lang': lang})
             if not tx['dated'] and q.get('ts'):  # date unreadable (English OCR drops the Thai month): photo's time
                 tx['ts'] = float(q['ts'][0]) / 1000
-            tx['note'] = 'KBank slip'
+            tx['note'] = 'Slip'
             if q.get('preview'):  # the app shows it for checking first, then saves through /api/tx
                 return self.send(200, {**tx, 'text': text[:500], 'lang': lang})
             return self.send(200, {**add_tx(tx, 'slip', text), 'lang': lang})
@@ -478,7 +480,7 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                 tx = parse_tx(text, source)
                 if not tx:
                     return self.send(422, {'error': 'no amount found'})
-                tx['note'] = 'KBank'
+                tx['note'] = 'SMS'
             return self.send(200, add_tx(tx, source, str(body.get('text', ''))))
         if path == '/api/edit':
             for field in ('ts', 'amount'):  # check before changing anything
@@ -641,7 +643,7 @@ const K='__KEY__',$=id=>document.getElementById(id);let kind='out',cat='';
 const CATS={out:['🍜 Food','🚆 Transport','🛍️ Shopping','💡 Bills','🎮 Fun','💊 Health','↔️ Transfer','📦 Other'],
  in:['💼 Salary','🎁 Gift','↩️ Refund','↔️ Transfer','🏷️ Sale','📦 Other']};
 let CUR='฿';  // currency and payday come from the island's settings with every load
-const baht=n=>n.toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2})+' '+CUR;
+const baht=n=>n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+' '+CUR;
 const nth=d=>d+({1:'st',2:'nd',3:'rd'}[d%10*(Math.floor(d/10)!=1)]||'th');
 for(let d=1;d<=31;d++)$('pd').add(new Option(nth(d)+' of the month',d));
 for(const c of __CURRENCIES__)$('cu').add(new Option(c,c));
@@ -739,7 +741,7 @@ $('files').onchange=async()=>{  // read each slip, show it for checking, save on
  const fs=[...$('files').files];let ok=0,skip=0,noThai=false;
  for(const [i,f] of fs.entries()){
   $('st').textContent=`Reading slip ${i+1} of ${fs.length}…`;
-  let d={amount:0,kind:'out',ts:f.lastModified/1000,note:'KBank slip',cat:'',source:'slip'},title=`Slip ${i+1} of ${fs.length}`;
+  let d={amount:0,kind:'out',ts:f.lastModified/1000,note:'Slip',cat:'',source:'slip'},title=`Slip ${i+1} of ${fs.length}`;
   try{const r=await fetch(`/api/slip?k=${K}&preview=1&ts=${f.lastModified}`,{method:'POST',
     headers:{'Content-Type':'image/jpeg'},body:await shrink(f)});
    const res=await r.json();if(res.lang&&res.lang!='th')noThai=true;
@@ -947,7 +949,7 @@ def keyboard_language():
     hwnd = user32.GetForegroundWindow()
     tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), None)
     lcid = (user32.GetKeyboardLayout(tid) or 0) & 0xFFFF
-    if lcid not in LANG_NAMES:  # look a language up once; this runs 4 times a second
+    if lcid not in LANG_NAMES:  # look a language up once; this runs twice a second
         name = ctypes.create_unicode_buffer(85)
         if not kernel32.LCIDToLocaleName(lcid, name, 85, 0):
             return None
@@ -958,7 +960,9 @@ def keyboard_language():
     if label == 'JA':  # the IME's open state is kana input, closed is plain letters
         ctypes.windll.imm32.ImmGetDefaultIMEWnd.restype = ctypes.c_void_p
         ime = ctypes.windll.imm32.ImmGetDefaultIMEWnd(ctypes.c_void_p(hwnd))
-        label = 'あ' if ime and user32.SendMessageW(ctypes.c_void_p(ime), 0x283, 0x5, 0) else 'A'  # IMC_GETOPENSTATUS
+        res = ctypes.c_size_t()  # IMC_GETOPENSTATUS; SMTO_ABORTIFHUNG: a frozen app must not freeze the island
+        sent = ime and user32.SendMessageTimeoutW(ctypes.c_void_p(ime), 0x283, 0x5, 0, 0x2, 100, ctypes.byref(res))
+        label = 'あ' if sent and res.value else 'A'
     return native, label
 
 
@@ -1795,23 +1799,26 @@ class Fox(QWidget):
 
 
 class Petals(QWidget):
-    """A short sakura drift across the closed pill when the fox comes out; asleep the rest of the time."""
+    """Sakura drifts across the closed pill while the fox is out: a burst when it comes out, then a few at a time.
+    50 ms frames, not 33: every frame repaints the see-through window."""
 
     def __init__(self, island):
         super().__init__(island)
         self.island, self.petals = island, []
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.timer = QTimer(self, timeout=self.step, interval=33)
+        self.timer = QTimer(self, timeout=self.step, interval=50)
         self.hide()
 
-    def burst(self, n=7):
+    def petal(self, spread=70):
         r = self.island.shape
-        self.setGeometry(r.toAlignedRect())
-        colors = (THEME['sakura'], THEME['lavender'], '#ffd1e6')
-        self.petals = [{'x': r.width() + random.uniform(0, 70), 'y': random.uniform(4, r.height() - 6),
-                        'vx': -random.uniform(0.9, 1.8), 'phase': random.uniform(0, 6.3),
-                        'rot': random.uniform(0, 360), 'spin': random.uniform(-6, 6), 'size': random.uniform(4, 6.5),
-                        'color': random.choice(colors)} for _ in range(n)]
+        return {'x': r.width() + random.uniform(0, spread), 'y': random.uniform(4, r.height() - 6),
+                'vx': -random.uniform(1.3, 2.7), 'phase': random.uniform(0, 6.3), 'rot': random.uniform(0, 360),
+                'spin': random.uniform(-9, 9), 'size': random.uniform(4, 6.5),
+                'color': random.choice((THEME['sakura'], THEME['lavender'], '#ffd1e6'))}
+
+    def burst(self, n=7):
+        self.setGeometry(self.island.shape.toAlignedRect())
+        self.petals = [self.petal() for _ in range(n)]
         self.show()
         self.timer.start()
 
@@ -1823,7 +1830,9 @@ class Petals(QWidget):
             pt['y'] += math.sin(pt['phase']) * 0.4
             pt['rot'] += pt['spin']
         self.petals = [pt for pt in self.petals if pt['x'] > -10]
-        if not self.petals or not self.island.fox.isVisible():
+        if self.island.fox.isVisible() and len(self.petals) < 3 and random.random() < 0.04:
+            self.petals.append(self.petal(10))  # one more now and then, never more than 3 after the burst
+        if not self.island.fox.isVisible():  # keeps running while the fox is out, even between petals
             self.timer.stop()
             self.hide()
         self.update()
@@ -1877,6 +1886,52 @@ class UsageRing(QWidget):
         p.setFont(QFont(FONT, 7))
         p.drawText(QRectF(0, 106, self.width(), 16), Qt.AlignCenter,
                    'of your biggest window' if self.pct is not None else 'no window running')
+
+
+class MoneyCalendar(QWidget):
+    """Month grid like the phone page: a dot for money out (coral) and in (mint) on each day; a day spent over
+    1.5x the cycle's daily average gets a sakura tint, today a sakura ring. Too small for amounts."""
+
+    def __init__(self):
+        super().__init__()
+        self.month, self.days, self.avg = dt.date.today().replace(day=1), {}, 0.0
+
+    def set(self, days, avg):
+        if (days, avg) != (self.days, self.avg):
+            self.days, self.avg = days, avg
+            self.update()
+
+    def shift(self, months):
+        self.month = shift_month(self.month, months)
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        cw, top = self.width() / 7, 16
+        rows = math.ceil((self.month.weekday() + calendar.monthrange(self.month.year, self.month.month)[1]) / 7)
+        ch = (self.height() - top) / rows
+        p.setFont(QFont(FONT, 7))
+        p.setPen(QColor(DIM))
+        for i, wd in enumerate(('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')):
+            p.drawText(QRectF(i * cw, 0, cw, top), Qt.AlignCenter, wd)
+        today = dt.date.today()
+        for day in range(1, calendar.monthrange(self.month.year, self.month.month)[1] + 1):
+            d = self.month.replace(day=day)
+            k = self.month.weekday() + day - 1  # cell index, Monday first
+            cell = QRectF(k % 7 * cw + 2, top + k // 7 * ch + 2, cw - 4, ch - 4)
+            i, o = self.days.get(d, (0.0, 0.0))
+            p.setPen(QPen(QColor(SAKURA), 1.5) if d == today else Qt.NoPen)
+            p.setBrush(QColor(THEME['sakura-tint'] if o and self.avg and o > self.avg * 1.5 else THEME['surface']))
+            p.drawRoundedRect(cell, 8, 8)
+            p.setPen(QColor(FG if d == today else DIM))
+            p.setFont(QFont(FONT, 7))
+            p.drawText(cell.adjusted(0, 0, 0, -6), Qt.AlignCenter, str(day))
+            dots = [c for v, c in ((o, RED), (i, GREEN)) if v]
+            p.setPen(Qt.NoPen)
+            for n, c in enumerate(dots):
+                p.setBrush(QColor(c))
+                p.drawEllipse(QPointF(cell.center().x() + (n - (len(dots) - 1) / 2) * 7, cell.bottom() - 5), 2.2, 2.2)
 
 
 class DayBars(QWidget):
@@ -2059,7 +2114,7 @@ def column(*items, spacing=2):
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(spacing)
     for it in items:
-        lay.addStretch(1) if it is None else lay.addWidget(it)
+        lay.addStretch(1) if it is None else lay.addSpacing(it) if isinstance(it, int) else lay.addWidget(it)
     return w
 
 
@@ -2137,7 +2192,7 @@ class Island(QWidget):
         self.tick_timer = QTimer(self, timeout=self.tick, interval=100)
         self.tick_timer.start()
         QTimer(self, timeout=self.stats, interval=1000).start()
-        QTimer(self, timeout=self.check_language, interval=250).start()
+        QTimer(self, timeout=self.check_language, interval=500).start()
         self.stats()
         if FROZEN:  # source runs update with git; the installed .exe checks GitHub a minute after start, then every 6 h
             QTimer.singleShot(60_000, self.check_update)
@@ -2245,7 +2300,6 @@ class Island(QWidget):
         # money page: today / month totals, latest entries, phone link
         self.m_totals = [Text(14, c, bold=True, family=ROUND) for c in (GREEN, RED, GREEN, RED)]
         heads = []
-        self.m_budget = Text(9, DIM)
         for label in ('TODAY', 'PAY CYCLE'):
             heads.append(Text(8, DIM))
             heads[-1].set(label)
@@ -2259,13 +2313,28 @@ class Island(QWidget):
         self.b_phone = pill_button('Connect iPhone', lambda: self.set_phone_sync(True))
         self.b_open = pill_button('Open', lambda: os.startfile(self.phone_url()) if self.phone_url() else None)
         self.b_qr = pill_button('QR code', lambda: self.open_guide(2))  # the guide's phone step
+        # left: totals with the month calendar under them; right: latest entries with the budget under them
+        self.m_cal, self.m_month = MoneyCalendar(), Text(9, FG, bold=True, align=Qt.AlignCenter)
+        self.m_cal.setFixedSize(318, 190)
+        self.m_month.setFixedWidth(120)
+        self.m_budget = [Text(13, c, bold=True, family=ROUND) for c in (FG, GREEN, SAKURA)]  # avg, can spend, payday
+        stats = []
+        for label, value in zip(('AVG SPENT / DAY', 'CAN SPEND / DAY', 'PAYDAY IN'), self.m_budget):
+            head = Text(8, DIM)
+            head.set(label)
+            head.setFixedWidth(112)
+            value.setFixedWidth(112)
+            stats.append(column(head, value, spacing=0))
+        month_bar = row(pill_button('‹', lambda: (self.m_cal.shift(-1), self.refresh_money())), self.m_month,
+                        pill_button('›', lambda: (self.m_cal.shift(1), self.refresh_money())), None, spacing=4)
         money_page = column(
-            row(column(heads[0], self.m_totals[0], self.m_totals[1], spacing=0),
-                column(heads[1], self.m_totals[2], self.m_totals[3], spacing=0),
-                column(*(row(*r, spacing=6) for r in self.m_rows), None, spacing=2), spacing=18),
-            self.m_budget, None, row(self.m_link, self.b_phone, self.b_qr, self.b_open, spacing=6), spacing=6)
-        money_page.layout().itemAt(0).widget().layout().setStretch(2, 1)
-        money_page.layout().itemAt(3).widget().layout().setStretch(0, 1)
+            row(column(row(column(heads[0], self.m_totals[0], self.m_totals[1], spacing=0),
+                           column(heads[1], self.m_totals[2], self.m_totals[3], spacing=0), spacing=18),
+                       month_bar, self.m_cal, spacing=4),
+                column(*(row(*r, spacing=6) for r in self.m_rows), None, row(*stats, None, spacing=8), spacing=2), spacing=18),
+            None, row(self.m_link, self.b_phone, self.b_qr, self.b_open, spacing=6), spacing=6)
+        money_page.layout().itemAt(0).widget().layout().setStretch(1, 1)
+        money_page.layout().itemAt(2).widget().layout().setStretch(0, 1)
 
         # claude page: 5-hour window ring | reset, today, week | last 7 days
         self.u_ring, self.u_bars = UsageRing(), DayBars()
@@ -2308,7 +2377,7 @@ class Island(QWidget):
         # calendar page: pick a day | time + text, that day's reminders
         self.cal = QCalendarWidget(gridVisible=False, verticalHeaderFormat=QCalendarWidget.NoVerticalHeader,
                                    minimumDate=QDate.currentDate())
-        self.cal.setFixedSize(260, 190)
+        self.cal.setFixedSize(300, 214)  # English day names need the width: Sunday was cut off
         self.cal.setFirstDayOfWeek(Qt.Monday)
         plain = QTextCharFormat()
         plain.setForeground(QColor(FG))
@@ -2649,8 +2718,16 @@ class Island(QWidget):
 
     def refresh_money(self):
         t, cur = money_totals(), money_prefs['currency']
-        self.m_budget.set(f'Avg spent {t["avg_day"]:,.0f} {cur}/day   ·   can spend {t["can_day"]:,.0f} {cur}/day   ·   '
-                          f'payday in {t["days_left"]} day{"s" * (t["days_left"] != 1)}')
+        days = {}
+        with money_lock:
+            for tx in money:
+                i, o = days.get(d := dt.date.fromtimestamp(tx['ts']), (0.0, 0.0))
+                days[d] = (i + tx['amount'], o) if tx['kind'] == 'in' else (i, o + tx['amount'])
+        self.m_cal.set(days, t['avg_day'])
+        self.m_month.set(self.m_cal.month.strftime('%B %Y'))
+        for w, text in zip(self.m_budget, (f'{t["avg_day"]:,.0f} {cur}', f'{t["can_day"]:,.0f} {cur}',
+                                           f'{t["days_left"]} day{"s" * (t["days_left"] != 1)}')):
+            w.set(text)
         for w, v, sign in zip(self.m_totals, (t['today_in'], t['today_out'], t['cycle_in'], t['cycle_out']),
                               '+−+−'):
             w.set(f'{sign}{v:,.2f} {cur}')
@@ -3121,6 +3198,7 @@ if __name__ == '__main__':
         threading.Thread(target=lambda: asyncio.run(media_loop()), daemon=True).start()
         threading.Thread(target=scan_processes, daemon=True).start()
         threading.Thread(target=watch_claude, daemon=True).start()
+        QLocale.setDefault(QLocale(QLocale.English, QLocale.UnitedStates))  # calendar and dates in English on any Windows
         app = QApplication(sys.argv)
         app.setStyleSheet(STYLE)
         island = Island()
