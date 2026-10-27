@@ -35,3 +35,5 @@ run it. It updates itself.
 3. For Money on your iPhone: Money tab → QR code. Turn on the phone page, scan the code with the iPhone camera,
    open it in Safari, then Share → Add to Home Screen. If Windows asks, click Allow.
 4. Set your payday and currency in Settings or on the phone page.
+5. Two PCs, one Money: on the second PC, paste the main PC's phone link in Settings → Link to main PC.
+   Both need Tailscale (or the same Wi-Fi), and the main PC keeps iPhone sync on.

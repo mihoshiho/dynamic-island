@@ -42,11 +42,11 @@ GEAR, LYRICS = '', ''
 SHELF, MONEY, CLAUDE = '', '', ''
 TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'claude', 'timer', 'calendar', 'settings']
 SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 250), 'system': (540, 220), 'claude': (700, 220),
-         'timer': (400, 180), 'calendar': (580, 260), 'settings': (520, 446), 'alert': (400, 160),
+         'timer': (400, 180), 'calendar': (580, 260), 'settings': (800, 350), 'alert': (400, 160),
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -59,6 +59,7 @@ SAVE = DATA / 'reminders.json'
 SETTINGS_FILE = DATA / 'settings.json'
 SHELF_FILE = DATA / 'shelf.json'
 MONEY_FILE = DATA / 'money.json'
+DELETED_FILE = DATA / 'money-deleted.json'
 MONEY_PORT = 8765
 if FROZEN:  # a windowed .exe has no console: keep errors in a file so bugs can be traced
     _log = open(DATA / 'error.log', 'a', encoding='utf-8', buffering=1)
@@ -67,7 +68,8 @@ if FROZEN:  # a windowed .exe has no console: keep errors in a file so bugs can 
     threading.excepthook = lambda a: sys.excepthook(a.exc_type, a.exc_value, a.exc_traceback)
 DEFAULTS = {'tiny_fullscreen': True, 'compact_lyrics': True, 'sound': True, 'screen': 0,
             'translation': None, 'pronunciation': None, 'auto_update': True, 'phone_sync': False, 'phone_key': None,
-            'fox': True, 'fox_sleep': 7200, 'payday': 26, 'currency': '฿'}
+            'fox': True, 'fox_sleep': 7200, 'payday': 26, 'currency': '฿', 'prefs_mt': 0,
+            'sync_url': None, 'sync_key': None}
 FOX_SLEEP_AFTER = [('30 min', 1800), ('1 hour', 3600), ('2 hours', 7200), ('3 hours', 10800)]
 TRANSLATIONS = [('Off', None), ('ไทย', 'th'), ('English', 'en'), ('日本語', 'ja')]
 PRONUNCIATIONS = [('Off', None), ('Romaji', 'romaji')]
@@ -205,7 +207,9 @@ IN_WORDS = ('เงินเข้า', 'รับโอน', 'รับเง�
 OUT_WORDS = ('เงินออก', 'ถอน', 'โอนเงิน', 'โอนออก', 'ชำระ', 'จ่าย', 'หักบัญชี', 'ซื้อ', 'paid', 'payment', 'withdraw',
              'debited', 'transfer to', 'purchase')
 THAI_MONTHS = ('ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.')
-money, money_lock = [], threading.Lock()  # [{id, ts, amount, kind 'in'|'out', note, source, raw}]
+money, money_lock = [], threading.Lock()  # [{id, ts, amount, kind 'in'|'out', note, source, raw, mt}]
+money_deleted = {}  # id -> when deleted, so a sync from the other PC doesn't bring it back
+sync_state, sync_wake = {'at': 0, 'error': None}, threading.Event()  # last sync with the main PC
 money_last = {'at': 0}  # newest added entry, for the pill flash
 
 
@@ -255,12 +259,37 @@ def load_money():
         money[:] = json.loads(MONEY_FILE.read_text('utf-8'))
     except (OSError, ValueError):
         money[:] = []
+    try:
+        money_deleted.update(json.loads(DELETED_FILE.read_text('utf-8')))
+    except (OSError, ValueError):
+        pass
 
 
 def save_money():
-    tmp = MONEY_FILE.with_suffix('.tmp')  # write then swap: a crash mid-write must not lose the history
-    tmp.write_text(json.dumps(money, ensure_ascii=False), 'utf-8')
-    tmp.replace(MONEY_FILE)
+    for path, data in ((MONEY_FILE, money), (DELETED_FILE, money_deleted)):
+        tmp = path.with_suffix('.tmp')  # write then swap: a crash mid-write must not lose the history
+        tmp.write_text(json.dumps(data, ensure_ascii=False), 'utf-8')
+        tmp.replace(path)
+
+
+def merge_money(items, deleted):
+    """Take entries and deletes from the other PC: a delete always wins, otherwise the newer edit (mt).
+    True when something changed here."""
+    changed = False
+    with money_lock:
+        for i, when in deleted.items():
+            if i not in money_deleted:
+                money_deleted[i], changed = when, True
+        mine = {t['id']: t for t in money}
+        for t in items:
+            old = mine.get(t.get('id'))
+            if t.get('id') in money_deleted or (old and old.get('mt', 0) >= t.get('mt', 0)):
+                continue
+            mine[t['id']], changed = {**t, 'raw': t.get('raw') or (old or {}).get('raw', '')}, True
+        if changed:
+            money[:] = sorted((t for t in mine.values() if t['id'] not in money_deleted), key=lambda x: x['ts'])
+            save_money()
+    return changed
 
 
 def add_tx(tx, source, raw=''):
@@ -271,10 +300,12 @@ def add_tx(tx, source, raw=''):
                     and abs(old['ts'] - tx['ts']) < 180:
                 if source not in old['source']:
                     old['source'] += f'+{source}'
+                    old['mt'] = time.time()
                     save_money()
                 return old
         new = {'id': secrets.token_hex(4), 'ts': tx['ts'], 'amount': round(tx['amount'], 2), 'kind': tx['kind'],
-               'note': tx.get('note', ''), 'cat': tx.get('cat', ''), 'source': source, 'raw': raw[:500]}
+               'note': tx.get('note', ''), 'cat': tx.get('cat', ''), 'source': source, 'raw': raw[:500],
+               'mt': time.time()}
         money.append(new)
         money.sort(key=lambda x: x['ts'])
         save_money()
@@ -355,7 +386,7 @@ TAILSCALE = ipaddress.ip_network('100.64.0.0/10')
 class MoneyHandler(http.server.BaseHTTPRequestHandler):
     """Receiver for the iPhone: Shortcuts POST bank texts, the web app reads and edits. Only private networks
     and Tailscale may connect, and every call carries the pairing key."""
-    key, icon, on_prefs = None, b'', None  # on_prefs: the island's set_money_pref
+    key, icon, on_prefs, on_sync = None, b'', None, None  # the island's set_money_pref and handle_sync
 
     def log_message(self, *a):  # no console in the packaged app
         pass
@@ -425,8 +456,9 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
             if q.get('preview'):  # the app shows it for checking first, then saves through /api/tx
                 return self.send(200, {**tx, 'text': text[:500], 'lang': lang})
             return self.send(200, {**add_tx(tx, 'slip', text), 'lang': lang})
+        limit = 2**23 if url.path == '/api/sync' else 65536  # sync carries the whole history
         try:
-            body = json.loads(self.rfile.read(min(int(self.headers.get('Content-Length', 0)), 65536)) or b'{}')
+            body = json.loads(self.rfile.read(min(int(self.headers.get('Content-Length', 0)), limit)) or b'{}')
         except ValueError:
             return self.send(400, {'error': 'bad json'})
         if not secrets.compare_digest(str(body.get('key', '')), self.key):
@@ -461,7 +493,9 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                     return self.send(404, {'error': 'no such entry'})
                 if body.get('delete'):
                     money.remove(t)
+                    money_deleted[t['id']] = time.time()
                 else:
+                    t['mt'] = time.time()
                     if body.get('kind') in ('in', 'out'):
                         t['kind'] = body['kind']
                     if 'note' in body:
@@ -481,6 +515,11 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 return self.send(400, {'error': 'bad payday or currency'})
             return self.send(200, money_prefs)
+        if path == '/api/sync':  # the island on another PC: takes its changes, answers with everything here
+            try:
+                return self.send(200, self.on_sync(body))
+            except (TypeError, ValueError, KeyError, AttributeError):
+                return self.send(400, {'error': 'bad sync data'})
         self.send(404, {'error': 'not found'})
 
 
@@ -735,8 +774,9 @@ async def read_slip(data):
     raise RuntimeError('no OCR language installed')
 
 
-def start_money_server(key, icon, on_prefs):
-    MoneyHandler.key, MoneyHandler.icon, MoneyHandler.on_prefs = key, icon, staticmethod(on_prefs)
+def start_money_server(key, icon, on_prefs, on_sync):
+    MoneyHandler.key, MoneyHandler.icon = key, icon
+    MoneyHandler.on_prefs, MoneyHandler.on_sync = staticmethod(on_prefs), staticmethod(on_sync)
     server = http.server.ThreadingHTTPServer(('0.0.0.0', MONEY_PORT), MoneyHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -2063,7 +2103,7 @@ class Island(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         first_run = not SETTINGS_FILE.exists()
         self.settings, self.tiny, self.fs_at = load_settings(), False, 0
-        self.updating, self.quit_now = None, False  # set by the update thread, acted on in tick
+        self.updating, self.quit_now, self.update_msg = None, False, ''  # set by the update thread, acted on in tick
         self.drop_hover = False  # files dragged over the island
         if first_run and FROZEN:  # freshly installed: start with Windows by default (toggle in Settings)
             autostart(True)
@@ -2089,6 +2129,7 @@ class Island(QWidget):
             self.set_setting('phone_key', secrets.token_urlsafe(9))  # pairing key in every phone URL and Shortcut
         self.build()
         self.set_phone_sync(self.settings['phone_sync'])
+        threading.Thread(target=self.sync_loop, daemon=True).start()
         self.shape = self.target()
         self.morph()
         if first_run:  # a new user: say hello once the island is on screen
@@ -2114,17 +2155,22 @@ class Island(QWidget):
                 self.tick()
             self.lang = lang
 
-    def check_update(self):
+    def check_update(self, now=False):
+        """now: the Check now button, which also runs with auto update off and says what it found."""
         def run():
             try:
                 found = newer_release()
                 if found:
                     self.updating = found[0]
+                    self.update_msg = f'updating to v{found[0]}…'
                     install_update(found[1])
                     self.quit_now = True  # the installer starts the new version
+                else:
+                    self.update_msg = 'up to date'
             except Exception:  # offline or GitHub down: try again next time
-                self.updating = None
-        if self.settings['auto_update'] and not self.updating:
+                self.updating, self.update_msg = None, "can't reach GitHub"
+        if (now or self.settings['auto_update']) and not self.updating:
+            self.update_msg = 'checking…' if now else ''
             threading.Thread(target=run, daemon=True).start()
 
     def build(self):
@@ -2313,6 +2359,13 @@ class Island(QWidget):
                                         if s == self.settings['fox_sleep']), 2))
         sleep_box.currentIndexChanged.connect(lambda i: self.set_setting('fox_sleep', FOX_SLEEP_AFTER[i][1]))
         self.phone_switch = Switch(self.settings['phone_sync'], self.set_phone_sync)
+        # another PC's island: paste the main PC's phone link, both then share one money history
+        self.sync_edit = QLineEdit(placeholderText="Main PC's phone link")
+        if self.settings['sync_url']:
+            self.sync_edit.setText(f'{self.settings["sync_url"]}/app/{self.settings["sync_key"]}')
+        self.sync_edit.setFixedWidth(150)
+        self.sync_edit.editingFinished.connect(self.set_sync_link)
+        self.sync_status = Text(10)  # "Link to main PC · Synced 12:03", the row's label
         # the same two pickers sit in Settings and in the guide; sync_money_widgets keeps them equal
         self.payday_boxes, self.currency_boxes = [], []
         for _ in range(2):
@@ -2324,21 +2377,36 @@ class Island(QWidget):
             cur.currentIndexChanged.connect(lambda i: self.set_money_pref(currency=CURRENCIES[i]))
             self.payday_boxes.append(pay)
             self.currency_boxes.append(cur)
+        def group(title, *rows):
+            t = Text(9, SAKURA, bold=True)
+            t.set(title)
+            return column(t, *rows, spacing=6)
+
+        self.update_label = Text(10)
+        self.update_label.set(f'Auto update  ·  v{VERSION}')
+        self.update_label.setMinimumWidth(170)  # Text has no natural width: the stretch next to it would eat it
         settings_page = column(
-            setting('Start with Windows', Switch(autostart(), autostart)),
-            setting('Tiny island in fullscreen apps and games', toggle('tiny_fullscreen')),
-            setting('Lyrics in small island', toggle('compact_lyrics')),
-            setting('Fox runs in the island when idle', toggle('fox')),
-            setting('Fox sleeps after the PC is idle for', sleep_box),
-            setting('Lyrics translation', choice('translation', TRANSLATIONS)),
-            setting('Lyrics pronunciation', choice('pronunciation', PRONUNCIATIONS)),
-            setting('Alert sound', toggle('sound')),
-            setting(f'Auto update  ·  v{VERSION}', toggle('auto_update')),
-            setting('iPhone sync for Money', self.phone_switch),
-            setting('Money: payday and currency', row(self.payday_boxes[0], self.currency_boxes[0], spacing=6)),
-            setting('Screen', self.screen_box),
+            row(column(group('General', setting('Start with Windows', Switch(autostart(), autostart)),
+                             setting('Screen', self.screen_box), setting('Alert sound', toggle('sound'))),
+                       group('Island', setting('Tiny in fullscreen games', toggle('tiny_fullscreen')),
+                             setting('Fox runs when idle', toggle('fox')), setting('Fox sleeps after idle', sleep_box)),
+                       group('Update', row(self.update_label, None, pill_button('Check now', lambda: self.check_update(True)),
+                                           toggle('auto_update'), spacing=8)),
+                       None, spacing=12),
+                column(group('Lyrics', setting('Lyrics in small island', toggle('compact_lyrics')),
+                             setting('Translation', choice('translation', TRANSLATIONS)),
+                             setting('Pronunciation', choice('pronunciation', PRONUNCIATIONS))),
+                       group('Money', setting('iPhone sync', self.phone_switch),
+                             setting('Payday and currency', row(self.payday_boxes[0], self.currency_boxes[0], spacing=6)),
+                             row(self.sync_status, self.sync_edit, spacing=8)),
+                       None, spacing=12),
+                spacing=24),
+            None,
             row(None, pill_button('Show guide', lambda: self.open_guide(0)), pill_button('Quit island', QApplication.quit)),
             spacing=6)
+        cols = settings_page.layout().itemAt(0).widget().layout()
+        cols.setStretch(0, 1)  # two equal columns; else the combo boxes on the right take the space
+        cols.setStretch(1, 1)
 
         # guide: a few steps on first start (and from Settings); the phone step also opens from the Money tab
         def body(text):
@@ -2441,7 +2509,8 @@ class Island(QWidget):
         self.set_setting('phone_sync', on)
         if on and not self.money_server:
             try:
-                self.money_server = start_money_server(self.settings['phone_key'], icon_png(), self.set_money_pref)
+                self.money_server = start_money_server(self.settings['phone_key'], icon_png(), self.set_money_pref,
+                                                       self.handle_sync)
             except OSError as e:  # port taken by another program
                 self.m_link.set(f'Phone sync failed: port {MONEY_PORT} busy ({e.strerror})', RED)
                 return self.sync_money_widgets()
@@ -2471,6 +2540,13 @@ class Island(QWidget):
             self.phone_switch.blockSignals(False)
         self.g_qr.set(self.phone_url())
         self.g_phone_on.setVisible(not on)
+        self.update_label.set(f'v{VERSION}  ·  {self.update_msg}' if self.update_msg else f'Auto update  ·  v{VERSION}')
+        s = sync_state
+        if not self.settings['sync_url']:
+            self.sync_status.set('Link to main PC', FG)
+        else:
+            self.sync_status.set('Main PC  ·  ' +(s['error'] or (time.strftime('synced %H:%M', time.localtime(s['at']))
+                                 if s['at'] else 'linking…')), RED if s['error'] else FG)
         self.g_link.set(self.phone_url() or "The code shows here once the phone page is on.")
 
     # --- guide ---
@@ -2499,9 +2575,9 @@ class Island(QWidget):
         self.tick()
         self.maybe_collapse()
 
-    def set_money_pref(self, payday=None, currency=None):
-        """From Settings, the guide or the phone (server thread): only plain values change here; the widgets
-        catch up in tick."""
+    def set_money_pref(self, payday=None, currency=None, mt=None):
+        """From Settings, the guide, the phone or a sync (server thread): only plain values change here; the
+        widgets catch up in tick. mt: when it was changed, the newer change wins in a sync."""
         if payday is not None:
             payday = int(payday)
             if not 1 <= payday <= 31:
@@ -2513,7 +2589,56 @@ class Island(QWidget):
                 raise ValueError(currency)
             money_prefs['currency'] = currency
             self.set_setting('currency', currency)
+        self.set_setting('prefs_mt', mt or time.time())
         self.money_at = 0  # Money tab redraws on the next tick
+
+    # --- sync with the island on another PC (Settings → Link to main PC) ---
+    def sync_payload(self):
+        with money_lock:
+            tx = [{k: v for k, v in t.items() if k != 'raw'} for t in money]
+            deleted = dict(money_deleted)
+        return {'tx': tx, 'deleted': deleted, 'prefs': {**money_prefs, 'mt': self.settings['prefs_mt']}}
+
+    def take_sync(self, d):
+        if merge_money(d['tx'], d['deleted']):
+            self.money_at = 0
+        p = d['prefs']
+        if p['mt'] > self.settings['prefs_mt']:
+            self.set_money_pref(p['payday'], p['currency'], p['mt'])
+
+    def handle_sync(self, body):  # server thread
+        self.take_sync(body)
+        return self.sync_payload()
+
+    def sync_loop(self):
+        """Every minute: send everything here to the main PC, take back everything there.
+        shortcut: sends the whole history each time (fine for a few thousand entries); send only changes if it grows."""
+        while True:
+            url, key = self.settings.get('sync_url'), self.settings.get('sync_key')
+            if url and key:
+                try:
+                    req = urllib.request.Request(f'{url}/api/sync', json.dumps({**self.sync_payload(), 'key': key}).encode(),
+                                                 {'Content-Type': 'application/json'})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        self.take_sync(json.loads(r.read()))
+                    sync_state.update(at=time.time(), error=None)
+                except urllib.error.HTTPError as e:
+                    sync_state['error'] = 'wrong link (key)' if e.code == 403 else f'main PC said {e.code}'
+                except (OSError, ValueError, KeyError, TypeError) as e:
+                    sync_state['error'] = "can't reach main PC" if isinstance(e, OSError) else 'bad answer'
+            sync_wake.wait(60)
+            sync_wake.clear()
+
+    def set_sync_link(self):
+        text = self.sync_edit.text().strip()
+        m = re.match(r'(https?://[^/\s]+)/app/([\w-]+)', text)
+        if text and not m:
+            sync_state['error'] = 'paste the whole phone link'
+            return
+        self.set_setting('sync_url', m[1] if m else None)
+        self.set_setting('sync_key', m[2] if m else None)
+        sync_state.update(at=0, error=None)
+        sync_wake.set()  # sync now, not in a minute
 
     def phone_url(self):
         if not self.money_server:
@@ -2923,8 +3048,9 @@ def selftest():
     ocr_en = parse_tx('27 n.n. 69 09:41 u.\nunti\nxxx-x-xl 234-x\n<-nnu:\n1,280.50\n0.00', 'slip')  # no Thai OCR
     assert ocr_en['amount'] == 1280.5 and not ocr_en['dated'], ocr_en
     assert parse_tx('จ ำ น ว น : 99.00 บ า ท', 'slip')['amount'] == 99.0  # Thai OCR's spaced-out letters
-    global MONEY_FILE
+    global MONEY_FILE, DELETED_FILE
     saved_file, MONEY_FILE = MONEY_FILE, pathlib.Path(os.environ.get('TEMP', '.')) / 'island_money_test.json'
+    saved_deleted, DELETED_FILE = DELETED_FILE, MONEY_FILE.with_name('island_deleted_test.json')
     money.clear()
     a = add_tx(sms_in, 'sms')
     b = add_tx({**sms_in, 'ts': when + 60}, 'slip')  # same transfer reported twice: merged
@@ -2952,8 +3078,20 @@ def selftest():
     assert t['cycle_out'] == 400 and t['days_left'] == 24 and round(t['avg_day']) == 67  # 400 over 6 days
     assert round(t['can_day'], 2) == round(29600 / 24, 2)
     money.clear()
+    # sync with another PC: newer edit wins, older loses, a delete always wins and stays deleted
+    money.extend([{'id': 'x', 'ts': 1.0, 'amount': 5.0, 'kind': 'out', 'mt': 10},
+                  {'id': 'y', 'ts': 2.0, 'amount': 7.0, 'kind': 'out', 'mt': 10, 'raw': 'sms text'}])
+    assert merge_money([{'id': 'x', 'ts': 1.0, 'amount': 9.0, 'kind': 'out', 'mt': 5},  # older: ignored
+                        {'id': 'y', 'ts': 2.0, 'amount': 8.0, 'kind': 'out', 'mt': 20},  # newer: taken, keeps raw
+                        {'id': 'z', 'ts': 3.0, 'amount': 1.0, 'kind': 'in', 'mt': 1}], {'x': 30})
+    assert [(t['id'], t['amount']) for t in money] == [('y', 8.0), ('z', 1.0)] and money[0]['raw'] == 'sms text'
+    assert not merge_money([{'id': 'x', 'ts': 1.0, 'amount': 5.0, 'kind': 'out', 'mt': 99}], {})  # deleted stays
+    assert json.loads(DELETED_FILE.read_text('utf-8')) == {'x': 30}
+    money.clear()
+    money_deleted.clear()
     MONEY_FILE.unlink(missing_ok=True)
-    MONEY_FILE = saved_file
+    DELETED_FILE.unlink(missing_ok=True)
+    MONEY_FILE, DELETED_FILE = saved_file, saved_deleted
     u = {'input_tokens': 1_000_000, 'output_tokens': 1_000_000, 'cache_read_input_tokens': 1_000_000,
          'cache_creation_input_tokens': 2_000_000, 'cache_creation': {'ephemeral_1h_input_tokens': 1_000_000,
                                                                       'ephemeral_5m_input_tokens': 1_000_000}}
