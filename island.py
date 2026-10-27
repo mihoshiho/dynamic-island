@@ -11,7 +11,7 @@ import psutil
 import segno
 from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QLocale, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
                             QVariantAnimation, QEasingCurve)
-from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRegion, QTextCharFormat
+from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QFileIconProvider,
                                QGraphicsOpacityEffect, QHBoxLayout, QLineEdit, QListView, QListWidget, QListWidgetItem,
                                QLabel, QMenu, QPushButton, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
@@ -41,12 +41,12 @@ COMPACT_H, TOP, WIN = 36, 8, (820, 470)
 GEAR, LYRICS = '', ''
 SHELF, MONEY, CLAUDE = '', '', ''
 TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'claude', 'timer', 'calendar', 'settings']
-SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 392), 'system': (540, 220), 'claude': (700, 220),
+SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 434), 'system': (540, 220), 'claude': (700, 220),
          'timer': (400, 180), 'calendar': (620, 284), 'settings': (800, 350), 'alert': (400, 160),
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -416,7 +416,8 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
         if url.path == f'/app/{self.key}':
             theme = ';'.join(f'--{k}:{v}' for k, v in THEME.items())  # the island's colours, one source
             page = MONEY_APP.replace('__KEY__', self.key).replace('__THEME__', theme)
-            return self.send(200, page.replace('__CURRENCIES__', json.dumps(CURRENCIES, ensure_ascii=False)), 'text/html')
+            page = page.replace('__CURRENCIES__', json.dumps(CURRENCIES, ensure_ascii=False)).replace('__ICONS__', json.dumps(ICONS))
+            return self.send(200, page, 'text/html')
         if url.path == f'/manifest/{self.key}.json':
             return self.send(200, {'name': 'Island Money', 'short_name': 'Money', 'display': 'standalone',
                                    'start_url': f'/app/{self.key}', 'background_color': BG,
@@ -430,7 +431,8 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                 return self.send(200, (FONT_DIR / name).read_bytes(), 'font/ttf')
         if url.path == '/api/tx' and secrets.compare_digest(k, self.key):
             with money_lock:
-                items = [{k2: v for k2, v in t.items() if k2 != 'raw'} for t in money[-2000:]]  # calendar history
+                # shortcut: the whole history on every 30 s poll (fine for years of entries); page it if it gets slow
+                items = [{k2: v for k2, v in t.items() if k2 != 'raw'} for t in money]
             return self.send(200, {'tx': items, 'totals': money_totals(), 'prefs': money_prefs})
         self.send(404, {'error': 'not found'})
 
@@ -482,6 +484,9 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
                     return self.send(422, {'error': 'no amount found'})
                 tx['note'] = 'SMS'
             return self.send(200, add_tx(tx, source, str(body.get('text', ''))))
+        if path == '/api/parse':  # Settings → Test a bank message: what would be read, nothing is saved
+            tx = parse_tx(str(body.get('text', '')), 'sms')
+            return self.send(200, tx) if tx else self.send(422, {'error': 'no amount found'})
         if path == '/api/edit':
             for field in ('ts', 'amount'):  # check before changing anything
                 if field in body:
@@ -525,9 +530,43 @@ class MoneyHandler(http.server.BaseHTTPRequestHandler):
         self.send(404, {'error': 'not found'})
 
 
+# MynaUI icons (MIT, github.com/praveenjuge/mynaui-icons): the inside of each 24 x 24 outline SVG
+ICONS = {
+    'home': '<path d="M6.133 21C4.955 21 4 20.02 4 18.81v-8.802c0-.665.295-1.295.8-1.71l5.867-4.818a2.09 2.09 0 0 1 2.666 0l5.866 4.818c.506.415.801 1.045.801 1.71v8.802c0 1.21-.955 2.19-2.133 2.19z"/><path d="M9.5 21v-5.5a2 2 0 0 1 2-2h1a2 2 0 0 1 2 2V21"/>',
+    'calendar': '<path d="M16.5 5V3m-9 2V3M3.25 8h17.5M3 10.044c0-2.115 0-3.173.436-3.981a3.9 3.9 0 0 1 1.748-1.651C6.04 4 7.16 4 9.4 4h5.2c2.24 0 3.36 0 4.216.412.753.362 1.364.94 1.748 1.65.436.81.436 1.868.436 3.983v4.912c0 2.115 0 3.173-.436 3.981a3.9 3.9 0 0 1-1.748 1.651C17.96 21 16.84 21 14.6 21H9.4c-2.24 0-3.36 0-4.216-.412a3.9 3.9 0 0 1-1.748-1.65C3 18.128 3 17.07 3 14.955z"/>',
+    'plus': '<path d="M18 12h-6m0 0H6m6 0V6m0 6v6"/>',
+    'cog': '<path d="M10.11 3.9a1 1 0 0 1 .995-.9h1.79a1 1 0 0 1 .995.9l.033.333a8 8 0 0 1 2.209.915l.259-.212a1 1 0 0 1 1.34.067l1.266 1.266a1 1 0 0 1 .067 1.34l-.212.26c.409.676.72 1.419.915 2.208l.332.033a1 1 0 0 1 .901.995v1.79a1 1 0 0 1-.9.995l-.333.033a8 8 0 0 1-.915 2.209l.212.259a1 1 0 0 1-.067 1.34l-1.266 1.266a1 1 0 0 1-1.34.067l-.26-.212a8 8 0 0 1-2.208.915l-.033.332a1 1 0 0 1-.995.901h-1.79a1 1 0 0 1-.995-.9l-.033-.333a8 8 0 0 1-2.209-.915l-.259.212a1 1 0 0 1-1.34-.067L5.003 17.73a1 1 0 0 1-.067-1.34l.212-.26a8 8 0 0 1-.915-2.208L3.9 13.89a1 1 0 0 1-.9-.995v-1.79a1 1 0 0 1 .9-.995l.333-.033a8 8 0 0 1 .915-2.209l-.212-.259a1 1 0 0 1 .067-1.34L6.27 5.003a1 1 0 0 1 1.34-.067l.26.212a8 8 0 0 1 2.208-.915z"/><path d="M14.5 12a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0"/>',
+    'chevron-left': '<path d="m15 6-6 6 6 6"/>',
+    'chevron-right': '<path d="m9 18 6-6-6-6"/>',
+    'x': '<path d="M18 6 6 18M6 6l12 12"/>',
+    'image': '<path d="M6.5 8a2 2 0 1 0 4 0 2 2 0 0 0-4 0m14.427 1.99c-6.61-.908-12.31 4-11.927 10.51"/><path d="M3 13.066c2.78-.385 5.275.958 6.624 3.1"/><path d="M3 9.4c0-2.24 0-3.36.436-4.216a4 4 0 0 1 1.748-1.748C6.04 3 7.16 3 9.4 3h5.2c2.24 0 3.36 0 4.216.436a4 4 0 0 1 1.748 1.748C21 6.04 21 7.16 21 9.4v5.2c0 2.24 0 3.36-.436 4.216a4 4 0 0 1-1.748 1.748C17.96 21 16.84 21 14.6 21H9.4c-2.24 0-3.36 0-4.216-.436a4 4 0 0 1-1.748-1.748C3 17.96 3 16.84 3 14.6z"/>',
+    'message-dots': '<path d="M12 11v-.5m4 .5v-.5M8 11v-.5m-4.536 6.328C2 15.657 2 14.771 2 11s0-5.657 1.464-6.828C4.93 3 7.286 3 12 3s7.071 0 8.535 1.172S22 7.229 22 11s0 4.657-1.465 5.828C19.072 18 16.714 18 12 18c-2.51 0-3.8 1.738-6 3v-3.212c-1.094-.163-1.899-.45-2.536-.96"/>',
+    'arrow-down-circle': '<path d="M12 7.5v9m3.5-3.5L12 16.5 8.5 13"/><path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0"/>',
+    'arrow-up-circle': '<path d="M12 16.5v-9M8.5 11 12 7.5l3.5 3.5"/><path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0"/>',
+    'bowl': '<path d="M15.017 21c.555 0 1.005-.448 1.005-1v-.45c0-.307.164-.563.433-.715a9 9 0 0 0 1.944-1.471 8.95 8.95 0 0 0 2.595-5.366c.061-.549-.395-.998-.95-.998H3.956c-.555 0-1.011.45-.95.998A8.95 8.95 0 0 0 5.6 17.364a9 9 0 0 0 1.833 1.408c.33.193.55.537.548.918v.307A1.003 1.003 0 0 0 8.986 21zM6 5v2m12-2v2m-6-4v4"/>',
+    'train': '<path d="M16 18H8m8 0 2 3m-2-3a3 3 0 0 0 3-3v-4M8 18l-2 3m2-3a3 3 0 0 1-3-3v-4m3 3v1m8-1v1M5 11h7m-7 0V6m7 5h7m-7 0V6m7 5V6m-7 0H5m7 0h7M5 6a3 3 0 0 1 3-3h8a3 3 0 0 1 3 3"/>',
+    'shopping-bag': '<path d="M8.935 7H7.773c-1.072 0-1.962.81-2.038 1.858l-.73 10C4.921 20.015 5.858 21 7.043 21h9.914c1.185 0 2.122-.985 2.038-2.142l-.73-10C18.189 7.81 17.299 7 16.227 7h-1.162m-6.13 0V5c0-1.105.915-2 2.043-2h2.044c1.128 0 2.043.895 2.043 2v2m-6.13 0h6.13"/>',
+    'lightning': '<path d="M10.564 13.708a.504.504 0 0 0-.496-.565H7a.506.506 0 0 1-.461-.702l3.907-9.128a.5.5 0 0 1 .46-.313h4.518c.353 0 .594.36.465.694l-2.225 5.712a.506.506 0 0 0 .464.694H17c.412 0 .647.479.398.813l-7.47 10.046c-.062.083-.191.03-.18-.072z"/>',
+    'controller': '<path d="M7.5 11.5v3M6 13h3m3-4.653c2.005 0 3.7-1.888 5.786-1.212 2.264.733 3.82 3.413 3.708 9.492-.022 1.224-.336 2.578-1.546 3.106-2.797 1.221-4.397-2.328-7-2.328h-1.897c-2.605 0-4.213 3.545-6.998 2.328-1.21-.528-1.525-1.882-1.547-3.107-.113-6.078 1.444-8.758 3.708-9.491C8.299 6.459 9.994 8.347 12 8.347m0-4.565v4.342M14.874 13h3"/>',
+    'heart': '<path d="M7.75 3.5C5.127 3.5 3 5.76 3 8.547 3 14.125 12 20.5 12 20.5s9-6.375 9-11.953C21 5.094 18.873 3.5 16.25 3.5c-1.86 0-3.47 1.136-4.25 2.79-.78-1.654-2.39-2.79-4.25-2.79"/>',
+    'arrow-left-right': '<path d="M6.5 7.5h11M14 4l3.5 3.5L14 11m3.5 5.5h-11M10 13l-3.5 3.5L10 20"/>',
+    'package': '<path d="M16.5 5.204c-1.19-.617-2.834-1.467-3.77-1.951-.267-.138-.4-.208-.541-.235a1 1 0 0 0-.378 0c-.14.027-.274.097-.542.235L3 7.533v7.826c0 .357 0 .536.054.694q.072.212.226.373c.115.12.273.202.589.366L12 21l8.131-4.208c.316-.164.474-.245.589-.366a1 1 0 0 0 .226-.373c.054-.159.054-.336.054-.692V7.533zM12 21v-9.063m9-4.404-9 4.404M3 7.533l4.5 2.202m4.5 2.202L7.5 9.735m0 0 9-4.531m-9 4.531v2.202"/>',
+    'briefcase': '<path d="m20.953 10.587-.692 7.2C20.067 19.551 19.403 21 15.692 21H8.308c-3.71 0-4.375-1.449-4.569-3.213l-.692-7.2m17.906 0c.25-2.196-.397-3.987-4.338-3.987h-9.23c-3.941 0-4.587 1.791-4.338 3.987m17.906 0C18.935 11.882 16.301 13.249 14 13.5M3.047 10.587C5.065 11.882 7.699 13.249 10 13.5m0 0a2 2 0 1 0 4 0m-4 0a2 2 0 1 1 4 0m1-6.9V4a1 1 0 0 0-1-1h-4a1 1 0 0 0-.708.293A1 1 0 0 0 9 4.001V6.6"/>',
+    'gift': '<path d="M12 21v-9m0-5H7.95c-2.77 0-2.94-4 0-4C11.1 3 12 7 12 7m0 0h4.05c2.896 0 2.896-4 0-4C12.9 3 12 7 12 7"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-7m17 0V9a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v3z"/>',
+    'undo': '<path d="M5.636 18.364A9 9 0 1 0 12 3C7.942 3 5.482 5.705 3 8.5"/><path d="M3 4.5v4h4"/>',
+    'tag': '<path d="M4.472 5.5H14.77a2 2 0 0 1 1.396.568l5.35 5.216a1 1 0 0 1 0 1.432l-5.35 5.216a2 2 0 0 1-1.396.568H4.472c-.95 0-2.222-.541-2.222-1.625v-9.75C2.25 6.041 3.523 5.5 4.472 5.5"/>',
+    'trash': '<path d="m18 9-.84 8.398c-.127 1.273-.19 1.909-.48 2.39a2.5 2.5 0 0 1-1.075.973C15.098 21 14.46 21 13.18 21h-2.36c-1.279 0-1.918 0-2.425-.24a2.5 2.5 0 0 1-1.076-.973c-.288-.48-.352-1.116-.48-2.389L6 9m7.5 6.5v-5m-3 5v-5m-6-4h4.615m0 0 .386-2.672c.112-.486.516-.828.98-.828h3.038c.464 0 .867.342.98.828l.386 2.672m-5.77 0h5.77m0 0H19.5"/>',
+    'chart-bar': '<path d="M21 21H9.4c-2.24 0-3.36 0-4.216-.436a4 4 0 0 1-1.748-1.748C3 17.96 3 16.84 3 14.6V3m4 13.5h5M7 12h10M7 7.5h7"/>',
+    'check': '<path d="m6 13.626 1.606 1.722c.886.95 1.329 1.424 1.825 1.574.436.131.9.096 1.315-.1.473-.224.852-.761 1.612-1.836L18 7"/>',
+}
+
+
+# The phone page: Home, Calendar, Settings tabs and an Add sheet. __KEY__, __THEME__, __CURRENCIES__ and __ICONS__
+# are filled in when it is served.
 MONEY_APP = '''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Money">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Money"><meta name="theme-color" content="#191919">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="manifest" href="/manifest/__KEY__.json"><link rel="apple-touch-icon" href="/icon.png">
 <title>Island Money</title><style>
@@ -538,197 +577,277 @@ MONEY_APP = '''<!doctype html><html lang="en"><head><meta charset="utf-8">
 @font-face{font-family:'Kiwi Maru';font-weight:400;src:url(/fonts/KiwiMaru-Regular.ttf);unicode-range:U+3000-30FF,U+4E00-9FFF,U+FF00-FFEF}
 @font-face{font-family:'Kiwi Maru';font-weight:500 700;src:url(/fonts/KiwiMaru-Medium.ttf);unicode-range:U+3000-30FF,U+4E00-9FFF,U+FF00-FFEF}
 @font-face{font-family:'Kiwi Round';font-weight:500;src:url(/fonts/KiwiMaru-Medium.ttf)}
-:root{__THEME__;--round:'Kiwi Round','Noto Sans',sans-serif}
+:root{__THEME__;--round:'Kiwi Round','Noto Sans',sans-serif;--nav:calc(72px + env(safe-area-inset-bottom))}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;background:var(--ground);color:var(--ink);font:16px 'Noto Sans','Kiwi Maru','Noto Sans Thai',-apple-system,sans-serif;
- padding:env(safe-area-inset-top) max(16px,env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + 24px) max(16px,env(safe-area-inset-left))}
-h1{font:500 28px var(--round);margin:18px 0 12px;display:flex;align-items:center;gap:8px}
-h2{font-size:12px;color:var(--muted);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin:22px 4px 8px}
-.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px}.card{background:var(--surface);border-radius:14px;padding:14px}
-.card small{color:var(--muted);font-size:13px}.in{color:var(--mint)}.out{color:var(--coral)}
-.big{font:500 20px var(--round);margin-top:4px;font-variant-numeric:tabular-nums}
-.list{background:var(--surface);border-radius:14px;overflow:hidden}
-.tx{display:flex;align-items:center;gap:10px;padding:12px 14px;border-top:1px solid var(--line)}.tx:first-child{border-top:0}
-.tx .w{flex:1;min-width:0}.tx .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tx .s{color:var(--muted);font-size:12px}
-.tx .a{font-weight:700;font-variant-numeric:tabular-nums}
-button{font:inherit;border:0;border-radius:10px;padding:10px 14px;background:var(--surface-2);color:var(--ink)}
-button:focus-visible,input:focus-visible{outline:none;box-shadow:0 0 0 3px #ff9ec866}
+body{margin:0;background:var(--ground);color:var(--ink);font:16px/1.5 'Noto Sans','Kiwi Maru','Noto Sans Thai',-apple-system,sans-serif;
+ padding:env(safe-area-inset-top) max(16px,env(safe-area-inset-right)) calc(var(--nav) + 24px) max(16px,env(safe-area-inset-left))}
+svg.i{width:22px;height:22px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+header{display:flex;align-items:center;gap:10px;margin:18px 2px 14px}
+header h1{font:500 26px var(--round);margin:0;flex:1}header small{color:var(--muted);font-size:13px}
+.petal{width:24px;height:24px;flex:none}
+h2{font-size:12px;color:var(--muted);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin:24px 4px 8px}
+.view{display:none}.view.on{display:block;animation:in .2s ease-out}
+@keyframes in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.card{background:var(--surface);border-radius:20px;padding:16px}
+.hero{background:linear-gradient(145deg,var(--sakura-tint),var(--surface) 70%);border:1px solid #ff9ec833}
+.hero small,.card small{color:var(--muted);font-size:13px;display:block}
+.money{font:500 clamp(28px,9vw,34px)/1.15 var(--round);overflow-wrap:anywhere;font-variant-numeric:tabular-nums;margin:2px 0 4px}
+.mid{font:500 clamp(15px,4.6vw,19px)/1.35 var(--round);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.in{color:var(--mint)}.out{color:var(--coral)}
+.bar{height:8px;border-radius:4px;background:var(--surface-2);overflow:hidden;margin:14px 0 6px}
+.bar i{display:block;height:100%;border-radius:4px;background:var(--sakura);transition:width .4s}
+.pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}
+.list{background:var(--surface);border-radius:20px;overflow:hidden}
+.tx{display:flex;align-items:center;gap:12px;padding:12px 14px;min-height:60px;border-top:1px solid var(--line);cursor:pointer;
+ width:100%;text-align:left;background:none;border-radius:0}
+.tx:first-child{border-top:0}.tx:active{background:var(--surface-2)}
+.tile{width:40px;height:40px;border-radius:13px;display:grid;place-items:center;flex:none}
+.tile.out{background:#ff7f9822}.tile.in{background:#86ebc022}
+.tx .w{flex:1;min-width:0;display:grid}.tx .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.tx .s{color:var(--muted);font-size:13px}.tx .a{font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.day{font-size:13px;color:var(--muted);font-weight:700;margin:18px 6px 6px;display:flex;justify-content:space-between}
+.empty{color:var(--muted);padding:22px 14px;text-align:center}
+button{font:inherit;border:0;border-radius:14px;min-height:44px;padding:10px 16px;background:var(--surface-2);color:var(--ink);cursor:pointer}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:none;box-shadow:0 0 0 3px #ff9ec880}
 .primary{background:var(--sakura);color:var(--on-sakura);font-weight:700}.primary:active{background:var(--sakura-deep)}
-form{display:grid;grid-template-columns:1fr auto;gap:8px}
-input{font:inherit;width:100%;padding:12px;border-radius:10px;border:0;background:var(--surface-2);color:var(--ink)}
-input::placeholder{color:var(--faint)}
-select{font:inherit;width:100%;padding:10px;border-radius:10px;border:0;background:var(--surface-2);color:var(--ink);
- margin-top:4px;-webkit-appearance:none;appearance:none}
-.prefs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
-.seg{display:flex;gap:6px}.seg button.on{background:var(--sakura);color:var(--on-sakura);font-weight:700}.full{grid-column:1/-1}
-.steps{background:var(--surface);border-radius:14px;padding:6px 16px;color:var(--muted);font-size:14px;line-height:1.5}
-.steps b{color:var(--ink)}
-code{background:var(--ground);color:var(--sakura);padding:2px 6px;border-radius:6px;word-break:break-all;font-size:13px}
-.empty{color:var(--muted);padding:18px 14px;text-align:center}
-.chips{display:flex;flex-wrap:wrap;gap:6px}.chip{padding:7px 13px;border-radius:999px;font-size:14px}
-.chip.on{background:var(--sakura);color:var(--on-sakura);font-weight:700}
-.day{font-size:13px;color:var(--muted);font-weight:700;margin:16px 4px 6px;display:flex;justify-content:space-between}
-.tx .e{font-size:22px;width:30px;text-align:center}
-.sheet{position:fixed;inset:0;background:#19191999;display:none;align-items:flex-end;z-index:9}.sheet.on{display:flex}
-.panel{background:var(--surface);width:100%;border-radius:20px 20px 0 0;padding:18px 16px calc(env(safe-area-inset-bottom) + 18px);
- display:grid;gap:12px}.panel input{background:var(--ground)}.panel .big{text-align:center;font-size:30px}
-.danger{color:var(--coral)}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}label{font-size:13px;color:var(--muted)}
-.petal{width:22px;height:22px;flex:none}
-.wide{grid-column:1/-1}.wide>small{display:block;margin-top:8px}
-details.steps{margin-top:24px}summary{cursor:pointer;color:var(--ink);font-weight:700;padding:10px 0;list-style:none}
-summary::-webkit-details-marker{display:none}summary::after{content:'▸';float:right;color:var(--muted)}
-details[open] summary::after{content:'▾'}
-.calbox{background:var(--surface);border-radius:14px;padding:10px}
-.calhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.calhead b{font:500 17px var(--round)}.calhead button{padding:6px 14px;font-size:18px}
+input,select,textarea{font:inherit;width:100%;min-height:48px;padding:12px 14px;border-radius:14px;border:0;background:var(--surface-2);
+ color:var(--ink);-webkit-appearance:none;appearance:none}
+textarea{min-height:96px;resize:vertical}input::placeholder,textarea::placeholder{color:var(--faint)}
+label{display:grid;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
+.seg{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--ground);border-radius:14px;padding:4px}
+.seg button{min-height:40px;border-radius:11px;background:none;color:var(--muted);font-weight:700}
+.seg button.on{background:var(--surface-2);color:var(--ink)}.seg button.on.out{color:var(--coral)}.seg button.on.in{color:var(--mint)}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{display:flex;align-items:center;gap:6px;min-height:40px;padding:8px 14px 8px 10px;border-radius:999px;font-size:14px}
+.chip svg.i{width:18px;height:18px}.chip.on{background:var(--sakura);color:var(--on-sakura);font-weight:700}
+nav{position:fixed;left:0;right:0;bottom:0;z-index:5;display:grid;grid-template-columns:repeat(5,1fr);align-items:center;
+ padding:8px 12px calc(8px + env(safe-area-inset-bottom));background:#231f21cc;-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);
+ border-top:1px solid #ffffff14}
+nav button{background:none;display:grid;justify-items:center;gap:2px;font-size:11px;color:var(--faint);padding:6px 0;min-height:52px}
+nav button.on{color:var(--sakura)}
+nav .add{width:56px;height:56px;min-height:56px;border-radius:20px;margin:auto;background:var(--sakura);color:var(--on-sakura);
+ box-shadow:0 6px 18px #f06aa655;place-items:center}nav .add svg.i{width:28px;height:28px;stroke-width:2}
+.sheet{position:fixed;inset:0;background:#0009;display:none;align-items:flex-end;z-index:9}.sheet.on{display:flex}
+.panel{background:var(--surface);width:100%;max-width:560px;margin:0 auto;border-radius:24px 24px 0 0;max-height:92vh;overflow:auto;
+ padding:10px 16px calc(env(safe-area-inset-bottom) + 18px);display:grid;gap:14px;animation:up .25s cubic-bezier(.2,.9,.3,1)}
+@keyframes up{from{transform:translateY(40px);opacity:.5}to{transform:none;opacity:1}}
+.grab{width:40px;height:5px;border-radius:3px;background:var(--line);margin:4px auto 0}
+.panel h3{margin:0;font:500 20px var(--round);text-align:center}
+.big{text-align:center;font:500 34px var(--round);min-height:64px;background:var(--ground)}
+.row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.danger{color:var(--coral)}
+.note{color:var(--muted);font-size:13px;text-align:center;margin:0}
+#pick{display:flex;align-items:center;justify-content:center;gap:8px}
+.calhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.calhead b{font:500 18px var(--round)}.calhead button{width:44px;padding:0;display:grid;place-items:center}
 .grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
 .wd{font-size:11px;color:var(--muted);text-align:center;padding-bottom:2px}
-.d{border-radius:10px;min-height:54px;padding:4px 2px;display:flex;flex-direction:column;align-items:center;gap:1px;
+.d{border-radius:12px;min-height:56px;padding:4px 2px;display:flex;flex-direction:column;align-items:center;gap:1px;background:var(--surface-2);
  font-size:10px;line-height:1.2;font-variant-numeric:tabular-nums;overflow:hidden}
 .d .n{font-size:12px;font-weight:700}.d .o{color:var(--coral)}.d .i{color:var(--mint)}
 .d.today{box-shadow:inset 0 0 0 2px var(--sakura)}.d.sel{background:var(--sakura-tint)}
-.d.blank{background:transparent;pointer-events:none}.d.over .o{font-weight:700}
-.d.start .n::after{content:'';display:block;width:4px;height:4px;border-radius:2px;background:var(--mint);margin:1px auto 0}
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}</style></head><body>
-<h1><svg class="petal" viewBox="-12 -12 24 24" aria-hidden="true"><g style="fill:var(--sakura)">
+.d.blank{background:transparent;pointer-events:none}.d.over{background:#ff7f9826}
+.set{display:grid;gap:12px}
+.tri{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:14px}
+.tri small{color:var(--muted);font-size:13px}
+.months{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:3px;align-items:end}
+.mo{display:grid;justify-items:center;gap:4px;background:none;padding:6px 0 2px;min-height:44px;border-radius:10px;font-size:10px;color:var(--muted)}
+.mo .bars{display:flex;align-items:flex-end;gap:2px;height:84px}.mo .bars i{width:5px;border-radius:3px;min-height:2px}
+.mo .bars i.in{background:var(--mint)}.mo .bars i.out{background:var(--coral)}.mo.sel{background:var(--sakura-tint);color:var(--ink)}
+.steps{color:var(--muted);font-size:14px}.steps b{color:var(--ink)}.steps ol{padding-left:20px;margin:8px 0}.steps li{margin:6px 0}
+code{background:var(--ground);color:var(--sakura);padding:2px 6px;border-radius:6px;white-space:nowrap;font-size:13px}
+code.ep{white-space:normal;word-break:break-all}
+.result{border-radius:14px;padding:12px 14px;background:var(--ground);font-size:14px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style></head><body>
+<header><svg class="petal" viewBox="-12 -12 24 24" aria-hidden="true"><g style="fill:var(--sakura)">
 <ellipse rx="4" ry="7" cy="-5"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(72)"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(144)"/>
 <ellipse rx="4" ry="7" cy="-5" transform="rotate(216)"/><ellipse rx="4" ry="7" cy="-5" transform="rotate(288)"/></g>
-<circle r="2.5" style="fill:var(--butter)"/></svg>Money</h1>
-<div class="cards"><div class="card"><small>Today</small><div class="big in" id="ti"></div><div class="big out" id="to"></div></div>
-<div class="card"><small id="cyc">Pay cycle</small><div class="big in" id="mi"></div><div class="big out" id="mo"></div></div>
-<div class="card wide"><div class="row2"><div><small>Avg spent / day</small><div class="big out" id="avg"></div></div>
-<div><small>Can spend / day</small><div class="big in" id="can"></div></div></div><small id="left"></small>
-<div class="prefs"><label>Payday<select id="pd"></select></label><label>Currency<select id="cu"></select></label></div></div></div>
-<h2>Calendar</h2>
-<div class="calbox"><div class="calhead"><button type="button" id="prev" aria-label="Previous month">‹</button>
-<b id="mon"></b><button type="button" id="next" aria-label="Next month">›</button></div>
-<div class="grid" id="grid"></div></div>
-<h2>Add</h2>
-<form id="f"><input id="amt" inputmode="decimal" placeholder="Amount ฿" required>
-<div class="seg"><button type="button" id="bo" class="on">Out</button><button type="button" id="bi">In</button></div>
-<div class="chips full" id="cats"></div>
-<input id="note" class="full" placeholder="Note (optional)"><button class="full primary">Add</button></form>
-<h2>Import slips</h2>
-<button id="pick" style="width:100%">Choose K PLUS slips from Photos</button>
-<input id="files" type="file" accept="image/*" multiple hidden><p class="s" id="st" style="color:var(--muted);margin:8px 4px"></p>
-<h2 style="display:flex;justify-content:space-between;align-items:center">History
-<button type="button" id="all" class="chip" hidden>Show all</button></h2><div id="list"></div>
-<div class="sheet" id="sheet"><div class="panel">
-<div class="s" id="e_title" style="text-align:center;color:var(--muted);font-size:13px"></div>
-<input class="big" id="e_amt" inputmode="decimal" placeholder="0.00">
-<div class="seg" style="justify-content:center"><button type="button" id="e_out">Out</button><button type="button" id="e_in">In</button></div>
-<div class="chips" id="e_cats"></div>
-<input id="e_note" placeholder="Note">
-<label>When it was received or spent<input id="e_when" type="datetime-local"></label>
-<div class="s" id="e_src" style="color:var(--muted);font-size:12px"></div>
-<div class="row2"><button id="e_del" class="danger">Delete</button><button id="e_save" class="primary">Save</button></div>
-<button id="e_close">Cancel</button></div></div>
-<details class="steps"><summary>iPhone Shortcuts setup</summary>
-<p>Each Shortcut ends with <b>Get Contents of URL</b>: URL <code id="ep"></code>, Method <b>POST</b>,
-Request Body <b>JSON</b> with <code>key</code> = <code>__KEY__</code>, <code>source</code> (below) and
-<code>text</code> = the input.</p>
-<p><b>1. KBank SMS</b> — Automation → Message → Sender contains <code>KBank</code> → Run Immediately →
-Get Contents of URL with <code>source</code> = <code>sms</code>, <code>text</code> = Shortcut Input.</p>
-<p><b>2. KBank email</b> — Automation → Email → Sender = KBank's alert address → Run Immediately →
-Get Contents of URL with <code>source</code> = <code>email</code>, <code>text</code> = Shortcut Input.</p>
-<p><b>3. Slips</b> — easiest: <b>Import slips</b> above. Or, to send them by itself every night: Automation →
-Time of Day → Run Immediately → Find Photos (Album is K PLUS, Date Taken is today) → Repeat with Each →
-Extract Text from Image → Get Contents of URL with <code>source</code> = <code>slip</code>, <code>text</code> =
-Extracted Text. Sending a slip twice is harmless: copies are merged.</p>
-<p>Away from home Wi-Fi? Install Tailscale on the PC and the iPhone and use the island's Tailscale address.</p>
-<p>Another bank? Its messages can't be read yet: add your money with <b>Add</b> above.</p></details>
+<circle r="2.5" style="fill:var(--butter)"/></svg><h1 id="title">Money</h1><small id="cyc"></small></header>
+
+<main>
+<section class="view on" id="v_home" aria-label="Home">
+ <div class="card hero"><small>Can spend per day</small><div class="money in" id="can"></div>
+  <small id="avg"></small><div class="bar" aria-hidden="true"><i id="prog"></i></div><small id="left"></small></div>
+ <div class="pair"><div class="card"><small>Today</small><div class="mid in" id="ti"></div><div class="mid out" id="to"></div></div>
+  <div class="card"><small>This pay cycle</small><div class="mid in" id="mi"></div><div class="mid out" id="mo"></div></div></div>
+ <h2>History</h2><div id="list"></div>
+</section>
+
+<section class="view" id="v_cal" aria-label="Calendar">
+ <div class="card"><div class="calhead"><button type="button" id="prev" aria-label="Previous month">__I_chevron-left__</button>
+  <b id="mon"></b><button type="button" id="next" aria-label="Next month">__I_chevron-right__</button></div>
+  <div class="grid" id="grid"></div></div>
+ <h2 id="dayhead">Today</h2><div id="daylist"></div>
+</section>
+
+<section class="view" id="v_hist" aria-label="History">
+ <div class="card"><div class="calhead"><button type="button" id="yprev" aria-label="Previous year">__I_chevron-left__</button>
+  <b id="year"></b><button type="button" id="ynext" aria-label="Next year">__I_chevron-right__</button></div>
+  <div class="tri"><div><small>Money in</small><div class="mid in" id="yin"></div></div>
+   <div><small>Money out</small><div class="mid out" id="yout"></div></div>
+   <div><small>Left</small><div class="mid" id="ynet"></div></div></div>
+  <div class="months" id="months"></div></div>
+ <h2 id="histhead"></h2><div id="histlist"></div>
+</section>
+
+<section class="view" id="v_set" aria-label="Settings">
+ <div class="card set"><div class="row2"><label>Payday<select id="pd"></select></label><label>Currency<select id="cu"></select></label></div>
+  <p class="note" style="text-align:left">Your pay cycle starts on payday. Mark your pay as Salary and it starts on the day it really comes.</p></div>
+ <h2>Test a bank message</h2>
+ <div class="card set"><label>Paste an SMS or notification from your bank<textarea id="tm" placeholder="e.g. Transfer 1,250.00 THB to ..."></textarea></label>
+  <button type="button" id="tbtn">Read it</button><div class="result" id="tres" hidden></div></div>
+ <h2>Send bank messages automatically</h2>
+ <div class="card set"><div class="seg"><button type="button" id="os_ios" class="on">iPhone</button><button type="button" id="os_and">Android</button></div>
+  <div class="steps" id="st_ios"><ol>
+   <li>Shortcuts → <b>Automation</b> → <b>Message</b> → Sender contains your bank's name (e.g. <code>KBank</code>) → <b>Run Immediately</b>.</li>
+   <li>Add <b>Get Contents of URL</b>: URL <code class="ep"></code>, Method <b>POST</b>, Request Body <b>JSON</b>:
+    <code>key</code> = <code>__KEY__</code>, <code>source</code> = <code>sms</code>, <code>text</code> = Shortcut Input.</li>
+   <li>Bank emails work the same with Automation → <b>Email</b> and <code>source</code> = <code>email</code>.</li></ol></div>
+  <div class="steps" id="st_and" hidden><ol>
+   <li>Install <b>MacroDroid</b> (free) from Google Play and allow it to read SMS.</li>
+   <li>New macro → Trigger <b>SMS Received</b> → from your bank's number or name.</li>
+   <li>Action <b>HTTP Request</b>: Method <b>POST</b>, URL <code class="ep"></code>, Content type <code>application/json</code>, Body
+    <code>{"key":"__KEY__","source":"sms","text":"…"}</code> with the SMS message text in place of … (Magic Text → SMS message).</li>
+   <li>Add this page to the home screen: Chrome menu → <b>Add to Home screen</b>.</li></ol></div>
+  <p class="note" style="text-align:left">Away from home Wi-Fi? Install Tailscale on the PC and the phone, and use the island's Tailscale address.
+  Not sure your bank works? Try one of its messages in <b>Test a bank message</b> above.</p></div>
+</section>
+</main>
+
+<nav aria-label="Main"><button type="button" data-v="home" class="on">__I_home__Home</button>
+<button type="button" data-v="cal">__I_calendar__Calendar</button>
+<button type="button" class="add" id="addbtn" aria-label="Add money">__I_plus__</button>
+<button type="button" data-v="hist">__I_chart-bar__History</button>
+<button type="button" data-v="set">__I_cog__Settings</button></nav>
+
+<div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="e_title"><div class="panel">
+<div class="grab"></div><h3 id="e_title">Add</h3>
+<div class="seg"><button type="button" id="e_out" class="out">Money out</button><button type="button" id="e_in" class="in">Money in</button></div>
+<label>Amount<input class="big" id="e_amt" inputmode="decimal" placeholder="0.00"></label>
+<div class="chips" id="e_cats" aria-label="Category"></div>
+<label>Note<input id="e_note" placeholder="Optional"></label>
+<label>When<input id="e_when" type="datetime-local"></label>
+<p class="note" id="e_src"></p>
+<div class="row2"><button type="button" id="e_close">Cancel</button><button type="button" id="e_save" class="primary">Save</button></div>
+<button type="button" id="e_del" class="danger">Delete</button>
+<button type="button" id="pick">__I_image__Import bank slips from Photos</button>
+<input id="files" type="file" accept="image/*" multiple hidden></div></div>
 <script>
-const K='__KEY__',$=id=>document.getElementById(id);let kind='out',cat='';
+const K='__KEY__',$=id=>document.getElementById(id),IC=__ICONS__;
+const icon=n=>`<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${IC[n]||IC.package}</svg>`;
+document.body.innerHTML=document.body.innerHTML.replace(/__I_([a-z-]+)__/g,(_,n)=>icon(n));
+// categories are saved as "emoji label" (the island shows the emoji); the page shows an icon instead
 const CATS={out:['🍜 Food','🚆 Transport','🛍️ Shopping','💡 Bills','🎮 Fun','💊 Health','↔️ Transfer','📦 Other'],
  in:['💼 Salary','🎁 Gift','↩️ Refund','↔️ Transfer','🏷️ Sale','📦 Other']};
-let CUR='฿';  // currency and payday come from the island's settings with every load
-const baht=n=>n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+' '+CUR;
+const CAT_ICON={Food:'bowl',Transport:'train',Shopping:'shopping-bag',Bills:'lightning',Fun:'controller',Health:'heart',
+ Transfer:'arrow-left-right',Other:'package',Salary:'briefcase',Gift:'gift',Refund:'undo',Sale:'tag'};
+const label=c=>(c||'').split(' ').slice(1).join(' ');
+let CUR='฿';
+const fmt=n=>n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+' '+CUR;
+const fmt0=n=>Math.round(n).toLocaleString('en-US')+' '+CUR;  // year totals: no satang, so three fit a phone
 const nth=d=>d+({1:'st',2:'nd',3:'rd'}[d%10*(Math.floor(d/10)!=1)]||'th');
 for(let d=1;d<=31;d++)$('pd').add(new Option(nth(d)+' of the month',d));
 for(const c of __CURRENCIES__)$('cu').add(new Option(c,c));
+const post=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,...b})});
 $('pd').onchange=async()=>{await post('/api/prefs',{payday:+$('pd').value});load()};
 $('cu').onchange=async()=>{await post('/api/prefs',{currency:$('cu').value});load()};
+for(const e of document.querySelectorAll('.ep'))e.textContent=location.origin+'/api/tx';
 const hhmm=d=>d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
 const local=ts=>{const d=new Date(ts*1000);return new Date(d-d.getTimezoneOffset()*6e4).toISOString().slice(0,16)};
-$('ep').textContent=location.origin+'/api/tx';
-function chips(el,k,sel,pick){  // one tap picks a category, a second tap on it clears it
- el.innerHTML='';for(const c of CATS[k]){const b=document.createElement('button');b.type='button';
-  b.className='chip'+(c==sel?' on':'');b.textContent=c;b.onclick=()=>pick(c==sel?'':c);el.appendChild(b)}}
-function setKind(k){kind=k;cat='';$('bo').className=k=='out'?'on':'';$('bi').className=k=='in'?'on':'';drawCats()}
-function drawCats(){chips($('cats'),kind,cat,c=>{cat=c;drawCats()})}
-$('bo').onclick=()=>setKind('out');$('bi').onclick=()=>setKind('in');drawCats();
-const post=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,...b})});
+const dm=ts=>new Date(ts*1000).toLocaleDateString('en-GB',{day:'numeric',month:'short'});
+const dkey=d=>d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate();
+const short=n=>n>=1e4?Math.round(n/1e3)+'k':n>=1e3?(n/1e3).toFixed(1)+'k':String(Math.round(n));
 function dayName(d){const t=new Date();t.setHours(0,0,0,0);const x=new Date(d);x.setHours(0,0,0,0);const n=(t-x)/864e5;
  return n==0?'Today':n==1?'Yesterday':d.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric'})}
-let txs=[],tot=null,calMonth=new Date(),selDay=null;calMonth.setDate(1);
-const dkey=d=>d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate();
-const short=n=>n>=1e4?Math.round(n/1e3)+'k':n>=1e3?(n/1e3).toFixed(1)+'k':String(Math.round(n));  // fits a day cell
-const dm=ts=>new Date(ts*1000).toLocaleDateString('en-GB',{day:'numeric',month:'short'});
+function show(v){for(const s of document.querySelectorAll('.view'))s.classList.toggle('on',s.id=='v_'+v);
+ for(const b of document.querySelectorAll('nav [data-v]'))b.classList.toggle('on',b.dataset.v==v);
+ $('title').textContent={home:'Money',cal:'Calendar',hist:'History',set:'Settings'}[v];scrollTo(0,0);history.replaceState(null,'','#'+v)}
+for(const b of document.querySelectorAll('nav [data-v]'))b.onclick=()=>show(b.dataset.v);
+function os(ios){$('os_ios').classList.toggle('on',ios);$('os_and').classList.toggle('on',!ios);$('st_ios').hidden=!ios;$('st_and').hidden=ios}
+$('os_ios').onclick=()=>os(true);$('os_and').onclick=()=>os(false);if(/Android/i.test(navigator.userAgent))os(false);
+let txs=[],tot=null,calMonth=new Date(),selDay=dkey(new Date());calMonth.setDate(1);
 async function load(){
- if($('sheet').classList.contains('on'))return;  // don't redraw under an open edit sheet
- const d=await (await fetch('/api/tx?k='+K)).json();txs=d.tx;tot=d.totals;const t=tot;
- CUR=d.prefs.currency;$('pd').value=d.prefs.payday;$('cu').value=CUR;$('amt').placeholder='Amount '+CUR;
- $('ti').textContent='+'+baht(t.today_in);$('to').textContent='−'+baht(t.today_out);
- $('cyc').textContent='Pay cycle · '+dm(t.cycle_start)+' – '+dm(t.payday-86400);
- $('mi').textContent='+'+baht(t.cycle_in);$('mo').textContent='−'+baht(t.cycle_out);
- $('avg').textContent=baht(t.avg_day);$('can').textContent=baht(t.can_day);
- $('left').textContent=`${t.days_left} day${t.days_left==1?'':'s'} until payday (${dm(t.payday)})`;
- drawCal();drawList()}
-function drawCal(){  // each day: money out (coral) and in (mint); strong when above the cycle's daily average
+ if($('sheet').classList.contains('on'))return;  // don't redraw under an open sheet
+ const d=await (await fetch('/api/tx?k='+K)).json();txs=d.tx.sort((a,b)=>a.ts-b.ts);tot=d.totals;const t=tot;
+ CUR=d.prefs.currency;$('pd').value=d.prefs.payday;$('cu').value=CUR;
+ $('can').textContent=fmt(t.can_day);$('avg').textContent='You spend about '+fmt(t.avg_day)+' a day';
+ const span=(t.payday-t.cycle_start)/86400;$('prog').style.width=Math.min(100,100*(span-t.days_left)/span)+'%';
+ $('left').textContent=`Payday in ${t.days_left} day${t.days_left==1?'':'s'} · ${dm(t.payday)}`;
+ $('cyc').textContent=dm(t.cycle_start)+' – '+dm(t.payday-86400);
+ $('ti').textContent='+'+fmt(t.today_in);$('to').textContent='−'+fmt(t.today_out);
+ $('mi').textContent='+'+fmt(t.cycle_in);$('mo').textContent='−'+fmt(t.cycle_out);
+ drawList($('list'),txs.slice(-60),'Nothing yet. Tap + to add money.');drawCal();drawHist()}
+function row(x){const when=new Date(x.ts*1000),r=document.createElement('button');r.type='button';r.className='tx';
+ r.innerHTML=`<span class="tile ${x.kind}">${icon(CAT_ICON[label(x.cat)]||(x.kind=='in'?'arrow-down-circle':'arrow-up-circle'))}</span>`+
+  '<span class="w"><span class="n"></span><span class="s"></span></span><span class="a '+x.kind+'"></span>';
+ r.querySelector('.n').textContent=label(x.cat)||x.note||(x.kind=='in'?'Money in':'Money out');
+ r.querySelector('.s').textContent=[x.cat&&x.note?x.note:'',hhmm(when),x.source].filter(Boolean).join(' · ');
+ r.querySelector('.a').textContent=(x.kind=='in'?'+':'−')+fmt(x.amount);r.onclick=()=>edit(x);return r}
+function drawList(L,items,empty){L.innerHTML='';
+ if(!items.length){L.innerHTML='<div class="list"><div class="empty"></div></div>';L.querySelector('.empty').textContent=empty;return}
+ let box=null,day='',sum=0,sumEl=null;
+ for(const x of items.slice().reverse()){const name=dayName(new Date(x.ts*1000));
+  if(name!=day){day=name;sum=0;const h=document.createElement('div');h.className='day';h.innerHTML='<span></span><span></span>';
+   h.firstChild.textContent=name;sumEl=h.lastChild;L.appendChild(h);box=document.createElement('div');box.className='list';L.appendChild(box)}
+  sum+=x.kind=='in'?x.amount:-x.amount;sumEl.textContent=(sum<0?'−':'+')+fmt(Math.abs(sum));box.appendChild(row(x))}}
+function drawCal(){  // each day: money out (coral) and in (mint); tinted when above 1.5x the daily average
  const days={};for(const x of txs){const k=dkey(new Date(x.ts*1000));(days[k]=days[k]||{i:0,o:0})[x.kind=='in'?'i':'o']+=x.amount}
  $('mon').textContent=calMonth.toLocaleDateString('en-GB',{month:'long',year:'numeric'});
  const G=$('grid');G.innerHTML=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(w=>`<div class="wd">${w}</div>`).join('');
- const lead=(calMonth.getDay()+6)%7,n=new Date(calMonth.getFullYear(),calMonth.getMonth()+1,0).getDate();
+ const lead=(calMonth.getDay()+6)%7,n=new Date(calMonth.getFullYear(),calMonth.getMonth()+1,0).getDate(),today=dkey(new Date());
  for(let i=0;i<lead;i++)G.insertAdjacentHTML('beforeend','<div class="d blank"></div>');
- const today=dkey(new Date()),start=tot?dkey(new Date(tot.cycle_start*1000)):'';
- for(let day=1;day<=n;day++){
-  const date=new Date(calMonth.getFullYear(),calMonth.getMonth(),day),k=dkey(date),v=days[k];
-  const c=document.createElement('button');c.type='button';
-  c.className='d'+(k==today?' today':'')+(k==selDay?' sel':'')+(k==start?' start':'')+(v&&tot&&v.o>tot.avg_day*1.5?' over':'');
+ for(let day=1;day<=n;day++){const date=new Date(calMonth.getFullYear(),calMonth.getMonth(),day),k=dkey(date),v=days[k];
+  const c=document.createElement('button');c.type='button';c.setAttribute('aria-label',date.toDateString());
+  c.className='d'+(k==today?' today':'')+(k==selDay?' sel':'')+(v&&tot&&v.o>tot.avg_day*1.5?' over':'');
   c.innerHTML=`<span class="n">${day}</span>`+(v&&v.o?`<span class="o">−${short(v.o)}</span>`:'')+(v&&v.i?`<span class="i">+${short(v.i)}</span>`:'');
-  c.onclick=()=>{selDay=selDay==k?null:k;drawCal();drawList()};G.appendChild(c)}}
+  c.onclick=()=>{selDay=k;drawCal()};G.appendChild(c)}
+ const [y,m,dd]=selDay.split('-').map(Number);$('dayhead').textContent=dayName(new Date(y,m-1,dd));
+ drawList($('daylist'),txs.filter(x=>dkey(new Date(x.ts*1000))==selDay),'Nothing on this day');
+ const h=$('daylist').querySelector('.day');if(h)h.remove()}  // the heading above already names the day
+let hYear=new Date().getFullYear(),hMonth=null;  // History: one year, or one month of it
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function drawHist(){
+ const inYear=txs.filter(x=>new Date(x.ts*1000).getFullYear()==hYear),sum=[...Array(12)].map(()=>({i:0,o:0}));
+ for(const x of inYear)sum[new Date(x.ts*1000).getMonth()][x.kind=='in'?'i':'o']+=x.amount;
+ const yi=sum.reduce((a,m)=>a+m.i,0),yo=sum.reduce((a,m)=>a+m.o,0),top=Math.max(1,...sum.map(m=>Math.max(m.i,m.o)));
+ $('year').textContent=hYear;$('yin').textContent='+'+fmt0(yi);$('yout').textContent='−'+fmt0(yo);
+ $('ynet').textContent=(yi-yo<0?'−':'+')+fmt0(Math.abs(yi-yo));$('ynet').className='mid '+(yi-yo<0?'out':'in');
+ const M=$('months');M.innerHTML='';
+ sum.forEach((m,i)=>{const b=document.createElement('button');b.type='button';b.className='mo'+(i===hMonth?' sel':'');
+  b.setAttribute('aria-label',`${MON[i]}: in ${fmt(m.i)}, out ${fmt(m.o)}`);
+  b.innerHTML=`<span class="bars"><i class="in" style="height:${84*m.i/top}px"></i><i class="out" style="height:${84*m.o/top}px"></i></span>${MON[i][0]}`;
+  b.onclick=()=>{hMonth=hMonth===i?null:i;drawHist()};M.appendChild(b)});
+ const shown=hMonth===null?inYear:inYear.filter(x=>new Date(x.ts*1000).getMonth()==hMonth);
+ $('histhead').textContent=(hMonth===null?'All of '+hYear:MON[hMonth]+' '+hYear)+` · ${shown.length} entr${shown.length==1?'y':'ies'}`;
+ drawList($('histlist'),shown,'Nothing in this '+(hMonth===null?'year':'month'))}
+$('yprev').onclick=()=>{hYear--;hMonth=null;drawHist()};$('ynext').onclick=()=>{hYear++;hMonth=null;drawHist()};
 $('prev').onclick=()=>{calMonth.setMonth(calMonth.getMonth()-1);drawCal()};
 $('next').onclick=()=>{calMonth.setMonth(calMonth.getMonth()+1);drawCal()};
-$('all').onclick=()=>{selDay=null;drawCal();drawList()};
-function drawList(){
- const L=$('list');L.innerHTML='';$('all').hidden=!selDay;
- const shown=txs.filter(x=>!selDay||dkey(new Date(x.ts*1000))==selDay);
- if(!shown.length){L.innerHTML='<div class="list"><div class="empty">'+(selDay?'Nothing on this day':'Nothing yet')+'</div></div>';return}
- let box=null,day='',sum=0,sumEl=null;
- for(const x of shown.slice().reverse()){
-  const when=new Date(x.ts*1000),name=dayName(when);
-  if(name!=day){day=name;sum=0;const h=document.createElement('div');h.className='day';
-   h.innerHTML='<span></span><span></span>';h.firstChild.textContent=name;sumEl=h.lastChild;L.appendChild(h);
-   box=document.createElement('div');box.className='list';L.appendChild(box)}
-  sum+=x.kind=='in'?x.amount:-x.amount;sumEl.textContent=(sum<0?'−':'+')+baht(Math.abs(sum));
-  const r=document.createElement('div');r.className='tx';
-  r.innerHTML='<div class="e"></div><div class="w"><div class="n"></div><div class="s"></div></div><div class="a '+x.kind+'"></div>';
-  const [emoji,...label]=(x.cat||'').split(' ');
-  r.querySelector('.e').textContent=x.cat?emoji:(x.kind=='in'?'⬇️':'⬆️');
-  r.querySelector('.n').textContent=x.note||label.join(' ')||x.source;
-  r.querySelector('.s').textContent=[hhmm(when),x.note&&x.cat?label.join(' '):'',x.source].filter(Boolean).join(' · ');
-  r.querySelector('.a').textContent=(x.kind=='in'?'+':'−')+baht(x.amount);
-  r.onclick=()=>edit(x);box.appendChild(r)}}
-// one sheet for both: editing a saved entry (cur.id set) and checking a new slip before it is saved (no id)
+// one sheet: add new money, edit an entry (cur.id), or check a slip before saving it (title set)
 let cur=null,answer=null;
-function edit(x,title){cur={...x};$('e_amt').value=x.amount?x.amount.toFixed(2):'';$('e_note').value=x.note||'';
- $('e_when').value=local(x.ts);$('e_title').textContent=title||'';
- $('e_src').textContent=title?'Check what the slip says, fix anything wrong, then Save':
-  'From '+x.source+(x.source.includes('slip')?' · time read from the slip':'');
- $('e_del').textContent=cur.id?'Delete':'Skip';drawEdit();$('sheet').classList.add('on');
+function chips(){const el=$('e_cats');el.innerHTML='';
+ for(const c of CATS[cur.kind]){const b=document.createElement('button');b.type='button';b.className='chip'+(c==cur.cat?' on':'');
+  b.innerHTML=icon(CAT_ICON[label(c)])+'<span></span>';b.lastChild.textContent=label(c);
+  b.onclick=()=>{cur.cat=c==cur.cat?'':c;chips()};el.appendChild(b)}}
+function drawKind(){$('e_amt').className='big '+cur.kind;$('e_out').classList.toggle('on',cur.kind=='out');$('e_in').classList.toggle('on',cur.kind=='in');chips()}
+function edit(x,title){cur={...x};const adding=!x.id&&!title;
+ $('e_amt').value=x.amount?x.amount.toFixed(2):'';$('e_note').value=x.note||'';$('e_when').value=local(x.ts);
+ $('e_title').textContent=title||(x.id?'Edit':'Add money');
+ $('e_src').textContent=title?'Check what the slip says, fix anything wrong, then Save':x.id?'From '+x.source:'';
+ $('e_del').hidden=adding;$('e_del').textContent=x.id?'Delete':'Skip this slip';$('pick').hidden=!adding;
+ drawKind();$('sheet').classList.add('on');if(adding)setTimeout(()=>$('e_amt').focus(),250);
  return new Promise(r=>answer=r)}
-function drawEdit(){$('e_amt').className='big '+cur.kind;$('e_out').className=cur.kind=='out'?'on':'';$('e_in').className=cur.kind=='in'?'on':'';
- chips($('e_cats'),cur.kind,cur.cat,c=>{cur.cat=c;drawEdit()})}
-$('e_out').onclick=()=>{if(cur.kind!='out'){cur.kind='out';cur.cat=''}drawEdit()};
-$('e_in').onclick=()=>{if(cur.kind!='in'){cur.kind='in';cur.cat=''}drawEdit()};
+$('addbtn').onclick=()=>edit({kind:'out',cat:'',note:'',amount:0,ts:Date.now()/1000,source:'manual'});
+$('e_out').onclick=()=>{if(cur.kind!='out'){cur.kind='out';cur.cat=''}drawKind()};
+$('e_in').onclick=()=>{if(cur.kind!='in'){cur.kind='in';cur.cat=''}drawKind()};
 const close=r=>{$('sheet').classList.remove('on');if(answer){answer(r);answer=null}load()};
 $('e_close').onclick=()=>close('cancel');$('sheet').onclick=e=>{if(e.target.id=='sheet')close('cancel')};
+document.addEventListener('keydown',e=>{if(e.key=='Escape'&&$('sheet').classList.contains('on'))close('cancel')});
 $('e_save').onclick=async()=>{
  const ts=new Date($('e_when').value).getTime()/1000,amount=parseFloat($('e_amt').value.replace(/,/g,''));
  if(!(amount>0)){$('e_amt').focus();return}
  const f={kind:cur.kind,cat:cur.cat||'',note:$('e_note').value,amount,...(isNaN(ts)?{}:{ts})};
- if(cur.id)await post('/api/edit',{id:cur.id,...f});else await post('/api/tx',{...f,source:'slip',text:cur.text||''});
+ if(cur.id)await post('/api/edit',{id:cur.id,...f});else await post('/api/tx',{...f,source:cur.source||'manual',text:cur.text||''});
  close('saved')};
 $('e_del').onclick=async()=>{if(!cur.id)return close('skipped');
  if(confirm('Delete this entry?')){await post('/api/edit',{id:cur.id,delete:true});close('deleted')}};
@@ -738,22 +857,22 @@ async function shrink(f){  // phone photos are huge: send at most 2000 px, as JP
  return new Promise(r=>c.toBlob(r,'image/jpeg',0.9))}
 $('pick').onclick=()=>$('files').click();
 $('files').onchange=async()=>{  // read each slip, show it for checking, save only what you confirm
- const fs=[...$('files').files];let ok=0,skip=0,noThai=false;
+ const fs=[...$('files').files];let ok=0,skip=0,noThai=false;close('cancel');
  for(const [i,f] of fs.entries()){
-  $('st').textContent=`Reading slip ${i+1} of ${fs.length}…`;
   let d={amount:0,kind:'out',ts:f.lastModified/1000,note:'Slip',cat:'',source:'slip'},title=`Slip ${i+1} of ${fs.length}`;
-  try{const r=await fetch(`/api/slip?k=${K}&preview=1&ts=${f.lastModified}`,{method:'POST',
-    headers:{'Content-Type':'image/jpeg'},body:await shrink(f)});
+  try{const r=await fetch(`/api/slip?k=${K}&preview=1&ts=${f.lastModified}`,{method:'POST',headers:{'Content-Type':'image/jpeg'},body:await shrink(f)});
    const res=await r.json();if(res.lang&&res.lang!='th')noThai=true;
    if(r.ok)d={...d,...res};else title+=' · could not read it, type it in'}catch(e){title+=' · could not read it, type it in'}
   const a=await edit(d,title);if(a=='saved')ok++;else skip++;if(a=='cancel')break}
- $('st').textContent=`${ok} slip${ok==1?'':'s'} saved`+(skip?`, ${skip} skipped`:'')+
-  (noThai?' · Thai OCR is not installed on the PC, so dates come from the photo':'');
- $('files').value='';load()};
-$('f').onsubmit=async e=>{e.preventDefault();
- await post('/api/tx',{amount:$('amt').value.replace(/,/g,''),kind,cat,note:$('note').value,source:'manual'});
- $('amt').value='';$('note').value='';cat='';drawCats();load()};
-load();setInterval(load,30000);  // own changes reload at once; the poll only catches SMS/emails
+ $('files').value='';
+ alert(`${ok} slip${ok==1?'':'s'} saved`+(skip?`, ${skip} skipped`:'')+(noThai?'. Thai text reading is not installed on the PC, so dates come from the photo.':''))};
+$('tbtn').onclick=async()=>{const R=$('tres');R.hidden=false;R.textContent='Reading…';
+ const r=await post('/api/parse',{text:$('tm').value}),d=await r.json();
+ R.textContent=r.ok?`${d.kind=='in'?'Money in':'Money out'}: ${fmt(d.amount)}`+
+  (d.dated?` · ${new Date(d.ts*1000).toLocaleString('en-GB')}`:' · no date found, the time it arrives is used')+'. Nothing was saved.'
+  :'No amount found in this message. Send a copy (hide the account number) so this bank can be added.'};
+const start=location.hash.slice(1);show({cal:'cal',hist:'hist',set:'set'}[start]||'home');  // #cal, #hist, #set and #add open directly
+load().then(()=>{if(start=='add')$('addbtn').click()});setInterval(load,30000);  // own changes reload at once; the poll only catches SMS/emails
 </script></body></html>'''
 
 
@@ -1798,6 +1917,34 @@ class Fox(QWidget):
                 p.drawText(QPointF(head + 4 * t + 2 * i, self.Z + 6 - t * (self.Z + 2)), 'z')
 
 
+class Veil(QWidget):
+    """The island's black over the open page, see-through by `alpha`: fades a new page in."""
+
+    def __init__(self, island):
+        super().__init__(island)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.shape, self.alpha = QRectF(), 0.0
+        self.hide()
+
+    def cover(self, shape, alpha):
+        if (shape, alpha) != (self.shape, self.alpha):
+            self.shape, self.alpha = QRectF(shape), alpha
+            self.setGeometry(shape.toAlignedRect())
+            self.setVisible(alpha > 0.001)
+            self.raise_()
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        c = QColor(BG)
+        c.setAlphaF(min(1.0, self.alpha))
+        p.setBrush(c)
+        r = min(self.shape.height() / 2, 34)
+        p.drawRoundedRect(QRectF(self.rect()), r, r)
+
+
 class Petals(QWidget):
     """Sakura drifts across the closed pill while the fox is out: a burst when it comes out, then a few at a time.
     50 ms frames, not 33: every frame repaints the see-through window."""
@@ -1888,9 +2035,13 @@ class UsageRing(QWidget):
                    'of your biggest window' if self.pct is not None else 'no window running')
 
 
+def short_money(n):  # same as the phone page: 950, 1.2k, 15k
+    return f'{n / 1e3:.0f}k' if n >= 1e4 else f'{n / 1e3:.1f}k' if n >= 1e3 else f'{n:.0f}'
+
+
 class MoneyCalendar(QWidget):
-    """Month grid like the phone page: a dot for money out (coral) and in (mint) on each day; a day spent over
-    1.5x the cycle's daily average gets a sakura tint, today a sakura ring. Too small for amounts."""
+    """Month grid like the phone page: money out (coral) and in (mint) on each day; a day spent over 1.5x the
+    cycle's daily average gets a sakura tint, today a sakura ring."""
 
     def __init__(self):
         super().__init__()
@@ -1926,12 +2077,12 @@ class MoneyCalendar(QWidget):
             p.drawRoundedRect(cell, 8, 8)
             p.setPen(QColor(FG if d == today else DIM))
             p.setFont(QFont(FONT, 7))
-            p.drawText(cell.adjusted(0, 0, 0, -6), Qt.AlignCenter, str(day))
-            dots = [c for v, c in ((o, RED), (i, GREEN)) if v]
-            p.setPen(Qt.NoPen)
-            for n, c in enumerate(dots):
-                p.setBrush(QColor(c))
-                p.drawEllipse(QPointF(cell.center().x() + (n - (len(dots) - 1) / 2) * 7, cell.bottom() - 5), 2.2, 2.2)
+            p.drawText(cell.adjusted(5, 2, 0, 0), Qt.AlignLeft | Qt.AlignTop, str(day))
+            p.setFont(QFont(FONT, 6, QFont.Bold))
+            lines = [(f'−{short_money(o)}', RED)] * bool(o) + [(f'+{short_money(i)}', GREEN)] * bool(i)
+            for n, (text, color) in enumerate(reversed(lines)):  # bottom up: in at the bottom, out above it
+                p.setPen(QColor(color))
+                p.drawText(cell.adjusted(0, 0, -4, -1 - n * 10), Qt.AlignRight | Qt.AlignBottom, text)
 
 
 class DayBars(QWidget):
@@ -2315,7 +2466,7 @@ class Island(QWidget):
         self.b_qr = pill_button('QR code', lambda: self.open_guide(2))  # the guide's phone step
         # left: totals with the month calendar under them; right: latest entries with the budget under them
         self.m_cal, self.m_month = MoneyCalendar(), Text(9, FG, bold=True, align=Qt.AlignCenter)
-        self.m_cal.setFixedSize(318, 190)
+        self.m_cal.setFixedSize(318, 232)  # room for the day number and two amounts
         self.m_month.setFixedWidth(120)
         self.m_budget = [Text(13, c, bold=True, family=ROUND) for c in (FG, GREEN, SAKURA)]  # avg, can spend, payday
         stats = []
@@ -2325,7 +2476,7 @@ class Island(QWidget):
             head.setFixedWidth(112)
             value.setFixedWidth(112)
             stats.append(column(head, value, spacing=0))
-        month_bar = row(pill_button('‹', lambda: (self.m_cal.shift(-1), self.refresh_money())), self.m_month,
+        month_bar = row(None, pill_button('‹', lambda: (self.m_cal.shift(-1), self.refresh_money())), self.m_month,
                         pill_button('›', lambda: (self.m_cal.shift(1), self.refresh_money())), None, spacing=4)
         money_page = column(
             row(column(row(column(heads[0], self.m_totals[0], self.m_totals[1], spacing=0),
@@ -2553,9 +2704,11 @@ class Island(QWidget):
         self.full.setParent(self)
         self.full.layout().setContentsMargins(22, 10, 22, 14)
 
-        self.c_fx, self.f_fx = QGraphicsOpacityEffect(self.compact), QGraphicsOpacityEffect(self.full)
+        self.c_fx = QGraphicsOpacityEffect(self.compact)
         self.compact.setGraphicsEffect(self.c_fx)
-        self.full.setGraphicsEffect(self.f_fx)
+        # pages fade in under a black veil, not an opacity effect: with the effect, the calendar came out
+        # see-through on the layered window
+        self.veil = Veil(self)
 
     # --- shape + animation ---
     def place(self):
@@ -2786,7 +2939,7 @@ class Island(QWidget):
         self.goal = t
         if self.expanded:
             self.full.setGeometry(t.toRect())
-            self.set_shape(self.shape)  # clip the new page to the old box before the first frame shows
+            self.set_shape(self.shape)  # hide the new page before the first frame shows
         self.anim.stop()
         self.anim.setStartValue(self.shape)
         self.anim.setEndValue(t)
@@ -2810,13 +2963,14 @@ class Island(QWidget):
         k = max(0.0, min(1.0, (r.height() - COMPACT_H) / (160 - COMPACT_H)))  # 0 compact .. 1 expanded
         self.compact.setGeometry(r.toRect())
         self.c_fx.setOpacity(max(0.0, 1 - k * 4))
-        self.f_fx.setOpacity(max(0.0, k * 2 - 1) if self.expanded else 0)
+        # a new page is laid out at its final size: it fades in once the box has nearly grown, so no text shows
+        # outside the box. No setMask on the page: it kept the calendar from painting on the layered window.
+        run = self.anim.state() == QVariantAnimation.Running
+        fade = max(0.0, min(1.0, (self.anim.currentTime() / self.anim.duration() - 0.4) / 0.4)) if run else 1.0
+        shown = max(0.0, k * 2 - 1) * fade if self.expanded else 0
         self.compact.setVisible(k < 0.25 and r.height() > COMPACT_H - 8)  # hidden in the tiny pill
         self.full.setVisible(self.expanded and k > 0.5)
-        # page laid out at its final size: show only the part inside the box while it grows or shrinks
-        path = QPainterPath()
-        path.addRoundedRect(r.translated(-QPointF(self.full.pos())), min(r.height() / 2, 34), min(r.height() / 2, 34))
-        self.full.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        self.veil.cover(r, 1 - shown if self.full.isVisible() else 0)
         # no setMask: the window is layered, so its transparent pixels already let clicks through, and changing
         # the window region left the old pixels behind as a square black box until the next full repaint
         self.update()
