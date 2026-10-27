@@ -11,7 +11,7 @@ import psutil
 import segno
 from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
                             QVariantAnimation, QEasingCurve)
-from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
+from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRegion, QTextCharFormat
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QFileIconProvider,
                                QGraphicsOpacityEffect, QHBoxLayout, QLineEdit, QListView, QListWidget, QListWidgetItem,
                                QLabel, QMenu, QPushButton, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
@@ -46,7 +46,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money'
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.2.0'
+VERSION = '1.2.1'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -2709,6 +2709,7 @@ class Island(QWidget):
         self.goal = t
         if self.expanded:
             self.full.setGeometry(t.toRect())
+            self.set_shape(self.shape)  # clip the new page to the old box before the first frame shows
         self.anim.stop()
         self.anim.setStartValue(self.shape)
         self.anim.setEndValue(t)
@@ -2735,6 +2736,10 @@ class Island(QWidget):
         self.f_fx.setOpacity(max(0.0, k * 2 - 1) if self.expanded else 0)
         self.compact.setVisible(k < 0.25 and r.height() > COMPACT_H - 8)  # hidden in the tiny pill
         self.full.setVisible(self.expanded and k > 0.5)
+        # page laid out at its final size: show only the part inside the box while it grows or shrinks
+        path = QPainterPath()
+        path.addRoundedRect(r.translated(-QPointF(self.full.pos())), min(r.height() / 2, 34), min(r.height() / 2, 34))
+        self.full.setMask(QRegion(path.toFillPolygon().toPolygon()))
         # no setMask: the window is layered, so its transparent pixels already let clicks through, and changing
         # the window region left the old pixels behind as a square black box until the next full repaint
         self.update()
