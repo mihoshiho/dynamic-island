@@ -46,7 +46,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money'
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -578,7 +578,7 @@ MONEY_APP = '''<!doctype html><html lang="en"><head><meta charset="utf-8">
 @font-face{font-family:'Kiwi Maru';font-weight:500 700;src:url(/fonts/KiwiMaru-Medium.ttf);unicode-range:U+3000-30FF,U+4E00-9FFF,U+FF00-FFEF}
 @font-face{font-family:'Kiwi Round';font-weight:500;src:url(/fonts/KiwiMaru-Medium.ttf)}
 :root{__THEME__;--round:'Kiwi Round','Noto Sans',sans-serif;--nav:calc(72px + env(safe-area-inset-bottom))}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;touch-action:manipulation}  /* no double-tap zoom; pinch still zooms */
 body{margin:0;background:var(--ground);color:var(--ink);font:16px/1.5 'Noto Sans','Kiwi Maru','Noto Sans Thai',-apple-system,sans-serif;
  padding:env(safe-area-inset-top) max(16px,env(safe-area-inset-right)) calc(var(--nav) + 24px) max(16px,env(safe-area-inset-left))}
 svg.i{width:22px;height:22px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
@@ -612,7 +612,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .primary{background:var(--sakura);color:var(--on-sakura);font-weight:700}.primary:active{background:var(--sakura-deep)}
 input,select,textarea{font:inherit;width:100%;min-height:48px;padding:12px 14px;border-radius:14px;border:0;background:var(--surface-2);
  color:var(--ink);-webkit-appearance:none;appearance:none}
-textarea{min-height:96px;resize:vertical}input::placeholder,textarea::placeholder{color:var(--faint)}
+textarea{min-height:96px;resize:vertical}
+input,select,textarea,label{min-width:0;max-width:100%}input[type=datetime-local]{display:block}
+html,body{overflow-x:hidden}  /* iOS: never side-scroll the page */input::placeholder,textarea::placeholder{color:var(--faint)}
 label{display:grid;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
 .seg{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--ground);border-radius:14px;padding:4px}
 .seg button{min-height:40px;border-radius:11px;background:none;color:var(--muted);font-weight:700}
@@ -629,6 +631,7 @@ nav .add{width:56px;height:56px;min-height:56px;border-radius:20px;margin:auto;b
  box-shadow:0 6px 18px #f06aa655;place-items:center}nav .add svg.i{width:28px;height:28px;stroke-width:2}
 .sheet{position:fixed;inset:0;background:#0009;display:none;align-items:flex-end;z-index:9}.sheet.on{display:flex}
 .panel{background:var(--surface);width:100%;max-width:560px;margin:0 auto;border-radius:24px 24px 0 0;max-height:92vh;overflow:auto;
+ overflow-x:hidden;grid-template-columns:minmax(0,1fr);
  padding:10px 16px calc(env(safe-area-inset-bottom) + 18px);display:grid;gap:14px;animation:up .25s cubic-bezier(.2,.9,.3,1)}
 @keyframes up{from{transform:translateY(40px);opacity:.5}to{transform:none;opacity:1}}
 .grab{width:40px;height:5px;border-radius:3px;background:var(--line);margin:4px auto 0}
@@ -657,6 +660,9 @@ nav .add{width:56px;height:56px;min-height:56px;border-radius:20px;margin:auto;b
 code{background:var(--ground);color:var(--sakura);padding:2px 6px;border-radius:6px;white-space:nowrap;font-size:13px}
 code.ep{white-space:normal;word-break:break-all}
 .result{border-radius:14px;padding:12px 14px;background:var(--ground);font-size:14px}
+.toast{position:fixed;left:16px;right:16px;bottom:calc(var(--nav) + 12px);z-index:10;background:var(--surface-2);color:var(--ink);
+ border-radius:16px;padding:12px 16px;font-size:14px;box-shadow:0 8px 24px #0008;opacity:0;transform:translateY(8px);transition:.25s;pointer-events:none}
+.toast.on{opacity:1;transform:none}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <header><svg class="petal" viewBox="-12 -12 24 24" aria-hidden="true"><g style="fill:var(--sakura)">
@@ -732,6 +738,7 @@ code.ep{white-space:normal;word-break:break-all}
 <button type="button" id="e_del" class="danger">Delete</button>
 <button type="button" id="pick">__I_image__Import bank slips from Photos</button>
 <input id="files" type="file" accept="image/*" multiple hidden></div></div>
+<div class="toast" id="toast" role="status"></div>
 <script>
 const K='__KEY__',$=id=>document.getElementById(id),IC=__ICONS__;
 const icon=n=>`<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${IC[n]||IC.package}</svg>`;
@@ -855,6 +862,7 @@ async function shrink(f){  // phone photos are huge: send at most 2000 px, as JP
  const b=await createImageBitmap(f),s=Math.min(1,2000/Math.max(b.width,b.height)),c=document.createElement('canvas');
  c.width=Math.round(b.width*s);c.height=Math.round(b.height*s);c.getContext('2d').drawImage(b,0,0,c.width,c.height);
  return new Promise(r=>c.toBlob(r,'image/jpeg',0.9))}
+function toast(t){$('toast').textContent=t;$('toast').classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').classList.remove('on'),5000)}
 $('pick').onclick=()=>$('files').click();
 $('files').onchange=async()=>{  // read each slip, show it for checking, save only what you confirm
  const fs=[...$('files').files];let ok=0,skip=0,noThai=false;close('cancel');
@@ -865,7 +873,7 @@ $('files').onchange=async()=>{  // read each slip, show it for checking, save on
    if(r.ok)d={...d,...res};else title+=' · could not read it, type it in'}catch(e){title+=' · could not read it, type it in'}
   const a=await edit(d,title);if(a=='saved')ok++;else skip++;if(a=='cancel')break}
  $('files').value='';
- alert(`${ok} slip${ok==1?'':'s'} saved`+(skip?`, ${skip} skipped`:'')+(noThai?'. Thai text reading is not installed on the PC, so dates come from the photo.':''))};
+ toast(`${ok} slip${ok==1?'':'s'} saved`+(skip?`, ${skip} skipped`:'')+(noThai?'. Dates came from the photos (Thai text reading is not on the PC).':''))};
 $('tbtn').onclick=async()=>{const R=$('tres');R.hidden=false;R.textContent='Reading…';
  const r=await post('/api/parse',{text:$('tm').value}),d=await r.json();
  R.textContent=r.ok?`${d.kind=='in'?'Money in':'Money out'}: ${fmt(d.amount)}`+
