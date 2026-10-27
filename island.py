@@ -46,7 +46,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money'
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.4.1'
+VERSION = '1.4.2'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -873,7 +873,7 @@ $('files').onchange=async()=>{  // read each slip, show it for checking, save on
    if(r.ok)d={...d,...res};else title+=' · could not read it, type it in'}catch(e){title+=' · could not read it, type it in'}
   const a=await edit(d,title);if(a=='saved')ok++;else skip++;if(a=='cancel')break}
  $('files').value='';
- toast(`${ok} slip${ok==1?'':'s'} saved`+(skip?`, ${skip} skipped`:'')+(noThai?'. Dates came from the photos (Thai text reading is not on the PC).':''))};
+ toast(`${ok} slip${ok==1?'':'s'} saved`+(skip?`, ${skip} skipped`:'')+(noThai?'. Dates came from the photos: check them if you took a photo later.':''))};
 $('tbtn').onclick=async()=>{const R=$('tres');R.hidden=false;R.textContent='Reading…';
  const r=await post('/api/parse',{text:$('tm').value}),d=await r.json();
  R.textContent=r.ok?`${d.kind=='in'?'Money in':'Money out'}: ${fmt(d.amount)}`+
@@ -885,8 +885,9 @@ load().then(()=>{if(start=='add')$('addbtn').click()});setInterval(load,30000); 
 
 
 async def read_slip(data):
-    """Text of a slip image via Windows' built-in OCR -> (text, language used). Thai needs Windows' Thai OCR pack;
-    without it English OCR still finds the amount, but not the Thai words or the month."""
+    """Text of a slip image via Windows' built-in OCR -> (text, language used). Windows has no Thai OCR (no
+    Language.OCR th-TH capability exists), so English OCR reads the amount but not the Thai words or month; the
+    date then comes from the photo. 'th' stays first in case Windows adds it."""
     stream = InMemoryRandomAccessStream()
     writer = DataWriter(stream)
     writer.write_bytes(data)

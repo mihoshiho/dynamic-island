@@ -27,7 +27,6 @@ RestartApplications=no
 
 [Tasks]
 Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
-Name: thaiocr; Description: "Read Thai bank slips (adds Windows' Thai text reading, asks for admin once)"
 
 [InstallDelete]
 ; files dropped by a newer version must not linger
@@ -45,8 +44,6 @@ Name: "{autodesktop}\Dynamic Island"; Filename: "{app}\DynamicIsland.exe"; Tasks
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "DynamicIsland"; Flags: uninsdeletevalue
 
 [Run]
-; Thai OCR is a Windows feature: only an admin can add it, so this one step asks; never during a silent update
-Filename: "powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -Command ""Add-WindowsCapability -Online -Name 'Language.OCR~~~th-TH~0.0.1.0'"""; Verb: runas; Flags: shellexec runhidden waituntilterminated skipifsilent; Tasks: thaiocr; StatusMsg: "Adding Thai text reading..."
 ; runs after a normal install (checkbox) and after a silent auto-update
 Filename: "{app}\DynamicIsland.exe"; Description: "Start Dynamic Island"; Flags: nowait postinstall
 

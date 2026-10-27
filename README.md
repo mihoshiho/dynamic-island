@@ -22,8 +22,6 @@ open.
 - Windows 10 or 11.
 - For Money: an iPhone or Android phone on the same Wi-Fi, or [Tailscale](https://tailscale.com) on both to use it
   from anywhere.
-- Optional, for reading Thai slips: Windows' Thai OCR pack (run in an admin PowerShell):
-  `Add-WindowsCapability -Online -Name "Language.OCR~~~th-TH~0.0.1.0"`
 
 ## Install
 
