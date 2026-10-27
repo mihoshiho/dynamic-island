@@ -38,3 +38,9 @@ run it. It updates itself.
 4. Set your payday and currency in Settings or on the phone page.
 5. Two PCs, one Money: on the second PC, paste the main PC's phone link in Settings → Link to main PC.
    Both need Tailscale (or the same Wi-Fi), and the main PC keeps iPhone sync on.
+6. Discord mute / deafen on the pill: at [discord.com/developers](https://discord.com/developers/applications) make
+   a New Application, add `http://127.0.0.1` under OAuth2 → Redirects, then paste its Client ID and Client Secret
+   in Settings → Discord and click Authorize in Discord. Click the badge to unmute, right-click to undeafen.
+7. Lyrics sync with no daily limit (optional, needs an NVIDIA GPU): install
+   [Everyric2](https://github.com/onpe5679/Everyric2) in `D:\code\Everyric2` with its `.venv`, then turn on
+   Settings → Lyrics → Sync on my PC. Songs it can't do fall back to the public Everyric.

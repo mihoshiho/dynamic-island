@@ -5,12 +5,13 @@ Run: pythonw island.py      (right-click the island to quit)
 Self-check: python island.py test
 """
 import asyncio, bisect, calendar, collections, ctypes, datetime as dt, faulthandler, functools, json, math, os, pathlib, random, re, sys, threading, time, urllib.parse
-import http.server, ipaddress, secrets, shutil, socket, subprocess, urllib.request, winreg, winsound
+import http.server, ipaddress, secrets, shutil, socket, struct, subprocess, urllib.request, winreg, winsound
 
 import psutil
 import segno
 from PySide6.QtCore import (Qt, QBuffer, QDate, QFileInfo, QLocale, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QTime, QTimer, QUrl,
                             QVariantAnimation, QEasingCurve)
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCharFormat
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QCalendarWidget, QComboBox, QFileIconProvider,
                                QGraphicsOpacityEffect, QHBoxLayout, QLineEdit, QListView, QListWidget, QListWidgetItem,
@@ -42,11 +43,11 @@ GEAR, LYRICS = '', ''
 SHELF, MONEY, CLAUDE = '', '', ''
 TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'claude', 'timer', 'calendar', 'settings']
 SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 434), 'system': (540, 220), 'claude': (700, 220),
-         'timer': (400, 180), 'calendar': (620, 284), 'settings': (800, 350), 'alert': (400, 160),
+         'timer': (400, 180), 'calendar': (620, 284), 'settings': (800, 410), 'alert': (400, 160),
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.4.2'
+VERSION = '1.5.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -69,7 +70,9 @@ if FROZEN:  # a windowed .exe has no console: keep errors in a file so bugs can 
 DEFAULTS = {'tiny_fullscreen': True, 'compact_lyrics': True, 'sound': True, 'screen': 0,
             'translation': None, 'pronunciation': None, 'auto_update': True, 'phone_sync': False, 'phone_key': None,
             'fox': True, 'fox_sleep': 7200, 'payday': 26, 'currency': '฿', 'prefs_mt': 0,
-            'sync_url': None, 'sync_key': None}
+            'sync_url': None, 'sync_key': None,
+            'discord_id': '', 'discord_secret': '', 'discord_token': None,
+            'everyric_local': False, 'everyric_path': r'D:\code\Everyric2'}
 FOX_SLEEP_AFTER = [('30 min', 1800), ('1 hour', 3600), ('2 hours', 7200), ('3 hours', 10800)]
 TRANSLATIONS = [('Off', None), ('ไทย', 'th'), ('English', 'en'), ('日本語', 'ja')]
 PRONUNCIATIONS = [('Off', None), ('Romaji', 'romaji')]
@@ -1024,6 +1027,196 @@ def watch_claude():
         time.sleep(60)
 
 
+# ---------- Discord: mute / deafen on the pill, through Discord's local RPC pipe ----------
+# Discord only talks to a registered app: the user makes one (free) and pastes its Client ID and Secret in
+# Settings; Discord asks once to allow it. Docs: https://docs.discord.com/developers/topics/rpc
+DISCORD_SCOPES = ['rpc', 'rpc.voice.read', 'rpc.voice.write']
+DISCORD_REDIRECT = 'http://127.0.0.1'  # must be listed under the app's OAuth2 redirects
+discord = {'status': '', 'in_voice': False, 'mute': False, 'deaf': False}  # written by the Discord thread
+
+
+class DiscordPipe:
+    """One connection to the Discord app: 8-byte header (opcode, length) then JSON."""
+
+    def __init__(self, client_id):
+        for i in range(10):
+            try:
+                self.f = open(rf'\\.\pipe\discord-ipc-{i}', 'r+b', buffering=0)
+                break
+            except OSError:
+                continue
+        else:
+            raise ConnectionError('Discord is not running')
+        self.send(0, {'v': 1, 'client_id': client_id})
+        if self.recv().get('evt') != 'READY':
+            raise ConnectionError('Discord said no to the handshake')
+
+    def send(self, op, obj):
+        data = json.dumps(obj).encode()
+        self.f.write(struct.pack('<ii', op, len(data)) + data)
+
+    def recv(self):
+        head = self.f.read(8)
+        if len(head) < 8:
+            raise ConnectionError('Discord closed the connection')
+        op, n = struct.unpack('<ii', head)
+        body = json.loads(self.f.read(n))
+        if op == 2:  # CLOSE
+            raise ConnectionError(body.get('message', 'Discord closed the connection'))
+        return body
+
+    def call(self, cmd, args=None, evt=None):
+        """Send a command and wait for its answer (events that arrive first go to on_event)."""
+        nonce = secrets.token_hex(8)
+        self.send(1, {'cmd': cmd, 'args': args or {}, 'nonce': nonce, **({'evt': evt} if evt else {})})
+        while True:
+            m = self.recv()
+            if m.get('nonce') == nonce:
+                if m.get('evt') == 'ERROR':
+                    raise PermissionError(m['data'].get('message', 'Discord error'))
+                return m['data']
+            self.on_event(m)
+
+    def on_event(self, m):
+        pass
+
+    def close(self):
+        self.f.close()
+
+
+def discord_token(settings, save, body):
+    """Trade a code or refresh token for an access token at Discord's OAuth2 endpoint."""
+    data = urllib.parse.urlencode({'client_id': settings['discord_id'], 'client_secret': settings['discord_secret'],
+                                   'redirect_uri': DISCORD_REDIRECT, **body}).encode()
+    req = urllib.request.Request('https://discord.com/api/oauth2/token', data,
+                                 {'Content-Type': 'application/x-www-form-urlencoded',
+                                  'User-Agent': f'DynamicIsland ({REPO}, {VERSION})'})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        t = json.loads(r.read())
+    t['expires_at'] = time.time() + t.get('expires_in', 0) - 60
+    save('discord_token', t)
+    return t
+
+
+def discord_login(pipe, settings, save):
+    """AUTHENTICATE with a saved token, refreshing it or asking Discord to allow the app when needed."""
+    t = settings['discord_token']
+    if t and t.get('expires_at', 0) < time.time() and t.get('refresh_token'):
+        try:
+            t = discord_token(settings, save, {'grant_type': 'refresh_token', 'refresh_token': t['refresh_token']})
+        except OSError:
+            t = None
+    if t:
+        try:
+            return pipe.call('AUTHENTICATE', {'access_token': t['access_token']})
+        except PermissionError:  # revoked or for another app
+            save('discord_token', None)
+    discord['status'] = 'click Authorize in Discord'
+    code = pipe.call('AUTHORIZE', {'client_id': settings['discord_id'], 'scopes': DISCORD_SCOPES})['code']
+    t = discord_token(settings, save, {'grant_type': 'authorization_code', 'code': code})
+    return pipe.call('AUTHENTICATE', {'access_token': t['access_token']})
+
+
+def watch_discord(settings, save):
+    """Keep one connection open and follow voice state; reconnect when Discord restarts."""
+    while True:
+        if not (settings['discord_id'] and settings['discord_secret']):
+            discord.update(status='', in_voice=False)
+            time.sleep(5)
+            continue
+        try:
+            pipe = DiscordPipe(settings['discord_id'])
+            discord_login(pipe, settings, save)
+
+            def on_event(m):
+                if m.get('evt') == 'VOICE_SETTINGS_UPDATE':
+                    discord.update(mute=m['data']['mute'], deaf=m['data']['deaf'])
+                elif m.get('evt') == 'VOICE_CHANNEL_SELECT':
+                    discord['in_voice'] = bool(m['data'].get('channel_id'))
+            pipe.on_event = on_event
+            v = pipe.call('GET_VOICE_SETTINGS')
+            discord.update(mute=v['mute'], deaf=v['deaf'],
+                           in_voice=bool(pipe.call('GET_SELECTED_VOICE_CHANNEL')), status='connected')
+            pipe.call('SUBSCRIBE', evt='VOICE_SETTINGS_UPDATE')
+            pipe.call('SUBSCRIBE', evt='VOICE_CHANNEL_SELECT')
+            while True:
+                on_event(pipe.recv())
+        except (OSError, ValueError, KeyError, TypeError, PermissionError) as e:
+            discord.update(in_voice=False, status='open Discord' if isinstance(e, ConnectionError) and
+                           'running' in str(e) else str(e)[:40] or 'Discord error')
+        time.sleep(10)
+
+
+def discord_toggle(settings, what):
+    """Flip mute or deafen on a second connection: the watching one is busy waiting for events."""
+    def run():
+        try:
+            pipe = DiscordPipe(settings['discord_id'])
+            pipe.call('AUTHENTICATE', {'access_token': settings['discord_token']['access_token']})
+            pipe.call('SET_VOICE_SETTINGS', {what: not discord[what]})
+            pipe.close()
+        except (OSError, ValueError, KeyError, TypeError, PermissionError):
+            pass  # the badge simply stays as it is
+    threading.Thread(target=run, daemon=True).start()
+
+
+# MynaUI outlines (MIT): microphone-off, and headphones with a slash for deafened
+MIC_OFF = ('<path d="M12 18v3m-4 0h8m-8-9.429V6.43C8 4.535 9.79 3 12 3c1.309 0 2.47.539 3.2 1.371M5 11c0 1.046.23 '
+           '2.039.641 2.93M19 11a7 7 0 0 1-11.425 5.425m2.077-2.077-2.077 2.077L3 21M21 3l-5 5m0 0v3.571C16 13.465 '
+           '14.21 15 12 15a4.44 4.44 0 0 1-2.348-.652M16 8l-6.348 6.348"/>')
+HEADPHONES_OFF = ('<path d="M21 17v-5a9 9 0 1 0-18 0v5"/><path d="M16 14.958c0-.511 0-.767.059-.97.135-.468.49-.824.93-.934 '
+                  '1.272-.318 1.53.864 2.443 1.232l.069.028c.992.417 1.497 1.478 1.495 2.554v.357c-.003.95-.51 1.835-1.353 '
+                  '2.272-.939.485-1.252 1.752-2.615 1.46-.437-.094-.797-.429-.95-.883C16 19.843 16 19.54 16 18.938zm-8 '
+                  '4.084c0 .511 0 .766-.059.97-.135.468-.49.824-.93.934-1.272.318-1.53-.865-2.443-1.232l-.062-.025c-.998-.418'
+                  '-1.504-1.48-1.502-2.557v-.364c.003-.946.509-1.828 1.353-2.265.939-.485 1.252-1.752 2.615-1.46.437.094.797'
+                  '.429.95.883.078.231.078.533.078 1.136z"/><path d="M3 3l18 18"/>')
+
+
+def icon_svg(paths, color):
+    return QSvgRenderer(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" '
+                        f'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{paths}</svg>'.encode())
+
+
+class VoiceBadge(QWidget):
+    """Round coral badge at the pill's right end while muted or deafened in a Discord voice channel.
+    Click: mute on/off. Right-click: deafen on/off. Hovering it does not open the island."""
+
+    def __init__(self, island):
+        super().__init__()
+        self.island, self.state = island, None
+        self.setFixedSize(26, 26)
+        self.setCursor(Qt.PointingHandCursor)
+        self.icons = {'mute': icon_svg(MIC_OFF, RED), 'deaf': icon_svg(HEADPHONES_OFF, RED)}
+        self.setToolTip('Discord: click to unmute, right-click to undeafen')
+        self.hide()
+
+    def set(self, state):
+        if state != self.state:
+            self.state = state
+            self.setVisible(bool(state))
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(THEME['sakura-tint']))
+        p.drawEllipse(self.rect())
+        if self.state:
+            self.icons[self.state].render(p, QRectF(5, 5, 16, 16))
+
+    def mousePressEvent(self, e):
+        discord_toggle(self.island.settings, 'deaf' if e.button() == Qt.RightButton else 'mute')
+        e.accept()
+
+    def contextMenuEvent(self, e):
+        e.accept()  # right-click toggles deafen, no Quit menu here
+
+    def leaveEvent(self, e):  # from the badge onto the pill: open the island as usual
+        if self.island.shape.contains(QPointF(self.island.mapFromGlobal(QCursor.pos()))):
+            self.island.enterEvent(None)
+
+
 def icon_png(size=180):
     """The island icon as PNG bytes, for the iPhone Home Screen (iOS wants PNG). Needs the Qt GUI thread."""
     img = QImage(size, size, QImage.Format_ARGB32)
@@ -1131,6 +1324,7 @@ def fullscreen_in_front(own_hwnd):
 # ---------- lyrics ----------
 def clean_title(t):
     t = re.sub(r'[(\[【].*?[)\]】]', '', t)
+    t = re.sub(r'\s*#\S+', '', t)  # "#1", "#shorts": a query of only the artist plus a hashtag finds random songs
     t = re.sub(r'(?i)\b(official|music video|lyrics?|mv|audio|4k)\b.*', '', t)
     return t.split('|')[0].strip(' -')
 
@@ -1185,22 +1379,35 @@ def lyric_queries(title, artist):
     return list(dict.fromkeys(queries))  # drop duplicates, keep order
 
 
+CJK = re.compile(r'[\u3040-\u30ff\u3400-\u9fff]')  # kana and kanji
+
+
 def fetch_lyrics(title, artist, length):
     """Line-synced lyrics from lrclib/NetEase -> (lines, plain text). Plain text, kept even when no
-    version's length matches the video, is what Everyric needs to build a sync for this exact video."""
+    version's length matches the video, is what Everyric needs to build a sync for this exact video.
+    A Japanese title never takes lyrics without Japanese in them: that is another song with a similar name."""
     failed, plain = False, None
+    fits = (lambda text: bool(CJK.search(text))) if CJK.search(clean_title(title)) else (lambda text: True)
     for source in (lrclib, netease):
         for query in lyric_queries(title, artist):
             try:
                 hits = source(query)
-                if hits and plain is None:
-                    plain = '\n'.join(t for _, t in parse_lrc(hits[0][1]()) if t) or None
                 if length > 0:  # duration far off the video's means another song or version
-                    hits = sorted((h for h in hits if abs(h[0] - length) <= 15), key=lambda h: abs(h[0] - length))
-                for _, text in hits[:2]:
-                    lines = parse_lrc(text())
-                    if lines:
-                        return lines, plain
+                    close = sorted((h for h in hits if abs(h[0] - length) <= 15), key=lambda h: abs(h[0] - length))
+                else:
+                    close = hits
+                for hit in list(dict.fromkeys(close[:2] + hits[:3])):  # best length matches, then top hits for plain
+                    if plain is not None and hit not in close[:2]:
+                        continue  # nothing to gain from this one: skip the download
+                    text = hit[1]()
+                    if not fits(text):
+                        continue
+                    if plain is None:
+                        plain = '\n'.join(t for _, t in parse_lrc(text) if t) or None
+                    if hit in close[:2]:
+                        lines = parse_lrc(text)
+                        if lines:
+                            return lines, plain
             except Exception:  # one source down must not hide the other
                 failed = True
     if failed and plain is None:
@@ -1210,6 +1417,33 @@ def fetch_lyrics(title, artist, length):
 
 # ---------- Everyric: lyrics aligned to the exact YouTube video, letter timing, pronunciation, translation ----------
 EVERYRIC = 'https://everyric.moref.co'
+# your own Everyric2 server (github.com/onpe5679/Everyric2) on this PC: same API, no daily limit on new syncs
+EVERYRIC_LOCAL = 'http://127.0.0.1:8000'
+everyric_local = {'on': False}  # set from Settings
+
+
+def local_everyric_up():
+    try:
+        return get_json(f'{EVERYRIC_LOCAL}/health') is not None
+    except Exception:
+        return False
+
+
+def start_local_everyric(path):
+    """Start the own server hidden, unless it already runs. Models stay in its folder, not on C:."""
+    py = pathlib.Path(path) / '.venv' / 'Scripts' / 'python.exe'
+    if not py.exists() or local_everyric_up():
+        return
+    d = pathlib.Path(path)
+    env = {**os.environ, 'HF_HOME': str(d / '.hf'), 'TORCH_HOME': str(d / '.torch'), 'EVERYRIC_MODEL_CACHE_DIR': str(d / '.hf'),
+           'EVERYRIC_AUDIO_CACHE_DIR': str(d / '.audio'),
+           # the new stack (omniASR + BS-PolarFormer separator): 9 of 10 test songs within 0.3 s of the public sync,
+           # ~12 s a song; its models are fetched once into .hf and .models. Hard songs need OWSM (not installed),
+           # those jobs fail and generate_sync falls back to the public server
+           'EVERYRIC_ALIGNMENT_ENGINE': 'omniasr', 'EVERYRIC_AUDIO_SEPARATOR_BACKEND': 'bs-polarformer-fp16',
+           'EVERYRIC_AUDIO_SEPARATOR_MODEL_DIR': str(d / '.models'), 'DATABASE_URL': 'sqlite+aiosqlite:///./everyric2-new.db'}
+    subprocess.Popen([str(py), '-m', 'uvicorn', 'everyric2.server.main:app', '--port', '8000'], cwd=path, env=env,
+                     creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 BROWSERS = ('chrome', 'msedge', 'firefox', 'opera', 'brave', 'vivaldi')
 VIDEO_RENDERER = re.compile(r'"videoRenderer":\{"videoId":"([\w-]{11})".*?"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"')
 
@@ -1230,7 +1464,17 @@ def find_video(title):
 def everyric(vid, title, artist, lang):
     """-> (lines, offset) or None. Each line: (start, text, {'chars': [(start, end, char)], 'pron': {...}, 'trans': {...}})."""
     q = {'title': title[:200], 'artist': artist[:200], **({'lang': lang} if lang else {})}
-    d = get_json(f'{EVERYRIC}/api/sync/{vid}?' + urllib.parse.urlencode(q))
+    d = {}
+    # syncs made on your own server first (your newest), then the public one (free lookups, knows most songs)
+    for base in (EVERYRIC_LOCAL, EVERYRIC) if everyric_local['on'] else (EVERYRIC,):
+        try:
+            d = get_json(f'{base}/api/sync/{vid}?' + urllib.parse.urlencode(q))
+        except Exception:
+            if base == EVERYRIC and not everyric_local['on']:
+                raise  # load_lyrics retries
+            continue
+        if d.get('found') and d.get('timestamps'):
+            break
     if not d.get('found') or not d.get('timestamps'):
         return None
     trans = {k: v for k, v in (d.get('translations_by_lang') or {}).items() if isinstance(v, list)}
@@ -1318,21 +1562,26 @@ def everyric_lang():
     return prefs['lang'] if prefs['lang'] in ('en', 'ja') else None  # Everyric translates to ko/en/ja only
 
 
-def generate_sync(key, vid, plain, lang):
-    """Ask Everyric to align these lyrics to this video (its daily limit is 15 per user), then load the result."""
+def generate_sync(key, vid, plain, lang, base=None):
+    """Ask Everyric to align these lyrics to this video (its daily limit is 15 per user), then load the result.
+    With the own server on, sync there first (no limit); if that fails (a hard song), try the public server."""
     def status(text):
         if same_song(key):
             media['gen'] = text
+    if base is None:
+        base = EVERYRIC_LOCAL if everyric_local['on'] and local_everyric_up() else EVERYRIC
     try:
-        status('Sending to Everyric…')
-        job = post_json(f'{EVERYRIC}/api/sync/generate', {
+        status('Syncing on your PC…' if base == EVERYRIC_LOCAL else 'Sending to Everyric…')
+        job = post_json(f'{base}/api/sync/generate', {
             'video_id': vid, 'lyrics': plain, 'title': key[0][:200], 'artist': key[1][:200],
             **({'target_lang': lang} if lang else {})})
         for _ in range(400):  # up to ~20 min
-            j = get_json(f'{EVERYRIC}/api/job/{job["job_id"]}')
+            j = get_json(f'{base}/api/job/{job["job_id"]}')
             if j.get('status') == 'completed':
                 break
             if j.get('status') == 'failed' or j.get('gone'):
+                if base == EVERYRIC_LOCAL:  # e.g. a hard song needing a model the own server lacks
+                    return generate_sync(key, vid, plain, lang, EVERYRIC)
                 return status(f'Sync failed {j.get("error") or ""}'.strip())
             p = j.get('progress') or 0
             status(f'{(j.get("stage") or j.get("status") or "working").capitalize()}  {p * 100 if p <= 1 else p:.0f}%')
@@ -2345,6 +2594,8 @@ class Island(QWidget):
         self.build()
         self.set_phone_sync(self.settings['phone_sync'])
         threading.Thread(target=self.sync_loop, daemon=True).start()
+        self.set_everyric_local(self.settings['everyric_local'])
+        threading.Thread(target=watch_discord, args=(self.settings, self.set_setting), daemon=True).start()
         self.shape = self.target()
         self.morph()
         if first_run:  # a new user: say hello once the island is on screen
@@ -2395,7 +2646,8 @@ class Island(QWidget):
         self.c_wave = Wave(20, 14)
         self.c_timer = Text(10, ORANGE, bold=True, align=Qt.AlignRight)
         self.c_timer.setFixedWidth(46)
-        self.compact = row(self.c_art, self.c_text, self.c_wave, self.c_timer, spacing=8)
+        self.c_voice = VoiceBadge(self)
+        self.compact = row(self.c_art, self.c_text, self.c_wave, self.c_timer, self.c_voice, spacing=8)
         self.compact.setParent(self)
         self.compact.layout().setContentsMargins(8, 6, 10, 6)  # near-even sides keep the clock centered
         self.petals = Petals(self)
@@ -2595,6 +2847,12 @@ class Island(QWidget):
         self.sync_edit.setFixedWidth(150)
         self.sync_edit.editingFinished.connect(self.set_sync_link)
         self.sync_status = Text(10)  # "Link to main PC · Synced 12:03", the row's label
+        self.d_id = QLineEdit(self.settings['discord_id'], placeholderText='Client ID')
+        self.d_secret = QLineEdit(self.settings['discord_secret'], placeholderText='Client Secret', echoMode=QLineEdit.Password)
+        for edit, key in ((self.d_id, 'discord_id'), (self.d_secret, 'discord_secret')):
+            edit.setFixedWidth(118)
+            edit.editingFinished.connect(lambda e=edit, k=key: self.set_discord(k, e.text().strip()))
+        self.d_status = Text(10)
         # the same two pickers sit in Settings and in the guide; sync_money_widgets keeps them equal
         self.payday_boxes, self.currency_boxes = [], []
         for _ in range(2):
@@ -2624,10 +2882,12 @@ class Island(QWidget):
                        None, spacing=12),
                 column(group('Lyrics', setting('Lyrics in small island', toggle('compact_lyrics')),
                              setting('Translation', choice('translation', TRANSLATIONS)),
-                             setting('Pronunciation', choice('pronunciation', PRONUNCIATIONS))),
+                             setting('Pronunciation', choice('pronunciation', PRONUNCIATIONS)),
+                             setting('Sync on my PC (own Everyric)', Switch(self.settings['everyric_local'], self.set_everyric_local))),
                        group('Money', setting('iPhone sync', self.phone_switch),
                              setting('Payday and currency', row(self.payday_boxes[0], self.currency_boxes[0], spacing=6)),
                              row(self.sync_status, self.sync_edit, spacing=8)),
+                       group('Discord', row(self.d_status, self.d_id, self.d_secret, spacing=8)),
                        None, spacing=12),
                 spacing=24),
             None,
@@ -2771,6 +3031,9 @@ class Island(QWidget):
             self.phone_switch.blockSignals(False)
         self.g_qr.set(self.phone_url())
         self.g_phone_on.setVisible(not on)
+        ready = self.settings['discord_id'] and self.settings['discord_secret']
+        self.d_status.set((discord['status'] or 'connecting…') if ready else 'Your Discord app',
+                          GREEN if discord['status'] == 'connected' else RED if ready and discord['status'] else FG)
         self.update_label.set(f'v{VERSION}  ·  {self.update_msg}' if self.update_msg else f'Auto update  ·  v{VERSION}')
         s = sync_state
         if not self.settings['sync_url']:
@@ -2860,6 +3123,17 @@ class Island(QWidget):
             sync_wake.wait(60)
             sync_wake.clear()
 
+    def set_everyric_local(self, on):
+        self.set_setting('everyric_local', on)
+        everyric_local['on'] = on
+        if on:  # the first start loads AI models: give it time in the background
+            threading.Thread(target=start_local_everyric, args=(self.settings['everyric_path'],), daemon=True).start()
+
+    def set_discord(self, key, value):
+        if value != self.settings[key]:
+            self.set_setting(key, value)
+            self.set_setting('discord_token', None)  # a new app needs its own permission
+
     def set_sync_link(self):
         text = self.sync_edit.text().strip()
         m = re.match(r'(https?://[^/\s]+)/app/([\w-]+)', text)
@@ -2938,6 +3212,7 @@ class Island(QWidget):
         else:
             busy = self.alert or media.get('playing') or self.timer_end
             w = self.flash[3] if self.flash else 320 if busy else 290 if self.settings['fox'] else 190  # idle: date + fox
+            w += 34 * bool(self.c_voice.state)  # room for the Discord badge
             h = COMPACT_H
         return QRectF((self.width() - w) / 2, TOP, w, h)
 
@@ -3030,6 +3305,8 @@ class Island(QWidget):
 
     # --- hover ---
     def enterEvent(self, e):
+        if self.c_voice.isVisible() and self.c_voice.rect().contains(self.c_voice.mapFromGlobal(QCursor.pos())):
+            return  # on the Discord badge: a click there toggles mute, it must not open the island
         self.expanded = True
         self.tick()  # fill the content now; collapsed ticks can be 0.5 s apart
 
@@ -3213,6 +3490,7 @@ class Island(QWidget):
         want = self.expanded and page == 'system'
         if want != procs_wanted.is_set():
             procs_wanted.set() if want else procs_wanted.clear()
+        self.c_voice.set(('deaf' if discord['deaf'] else 'mute' if discord['mute'] else None) if discord['in_voice'] else None)
         if not self.expanded:
             self.morph()
             return
@@ -3290,6 +3568,7 @@ def selftest():
     slip = parse_tx('โอนเงินสำเร็จ\n26 ต.ค. 69 14:05 น.\nนาย ก\nจำนวน:\n350.00 บาท\nค่าธรรมเนียม:\n0.00 บาท', 'slip')
     assert slip == {'ts': when, 'amount': 350.0, 'kind': 'out', 'dated': True}, slip
     assert parse_tx('สวัสดีครับ', 'sms') is None
+    assert '#1' not in ' '.join(lyric_queries('【Original MV】電脳 / V.W.P #1【系譜曲】', 'V.W.P'))
     ocr_en = parse_tx('27 n.n. 69 09:41 u.\nunti\nxxx-x-xl 234-x\n<-nnu:\n1,280.50\n0.00', 'slip')  # no Thai OCR
     assert ocr_en['amount'] == 1280.5 and not ocr_en['dated'], ocr_en
     assert parse_tx('จ ำ น ว น : 99.00 บ า ท', 'slip')['amount'] == 99.0  # Thai OCR's spaced-out letters
