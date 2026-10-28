@@ -28,8 +28,11 @@ THEME = {'ground': '#191919', 'surface': '#231f21', 'surface-2': '#2e282b', 'lin
          'sakura-tint': '#3a2430', 'on-sakura': '#2a1520', 'fox': '#ffa86b', 'fox-cream': '#fff4e8',
          'fox-ink': '#2b1d14', 'mint': '#86ebc0', 'coral': '#ff7f98', 'lavender': '#c4a8ff', 'sky': '#8ccfff',
          'butter': '#ffe29a'}
-BG, PANEL, FG, DIM, FAINT = THEME['ground'], THEME['surface-2'], THEME['ink'], THEME['muted'], THEME['faint']
-SAKURA, ON_SAKURA, LINE = THEME['sakura'], THEME['on-sakura'], THEME['line']
+# Mochi look: the island is a soft warm gray, one step above the black desktop; cards and lines step up again.
+# The phone app keeps THEME as it is.
+BG, CARD, PANEL, LINE = '#2e282b', '#353033', '#3d3639', '#4a4245'
+FG, DIM, FAINT = THEME['ink'], THEME['muted'], THEME['faint']
+SAKURA, ON_SAKURA = THEME['sakura'], THEME['on-sakura']
 GREEN, ORANGE, RED = THEME['mint'], THEME['fox'], THEME['coral']  # money in · timers and alerts · money out
 BLUE, PURPLE = THEME['sky'], THEME['lavender']  # CPU and RAM graphs
 ROUND = 'Kiwi Maru'  # the round face for big numbers: timer, money totals
@@ -47,7 +50,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money'
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.5.1'
+VERSION = '1.6.0'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -1315,10 +1318,43 @@ class VoiceBadge(QWidget):
             self.island.enterEvent(None)
 
 
+# Tabler outline (MIT): wifi with a slash
+WIFI_OFF = ('<path d="M12 18h.01"/><path d="M9.172 15.172a4 4 0 0 1 5.656 0"/><path d="M6.343 12.343a7.963 7.963 0 0 1 '
+            '3.864-2.14m4.163.155a7.965 7.965 0 0 1 3.287 2"/><path d="M3.515 9.515a12 12 0 0 1 3.544-2.455m3.101-.92a12 '
+            '12 0 0 1 10.325 3.374"/><path d="M3 3l18 18"/>')
+net = {'up': True}  # written by watch_net
+
+
+def watch_net():
+    """Offline after 2 failed tries in a row (10 s), so one lost packet doesn't flash the badge."""
+    misses = 0
+    while True:
+        try:
+            socket.create_connection(('1.1.1.1', 53), 2).close()
+            misses = 0
+        except OSError:
+            misses += 1
+        net['up'] = misses < 2
+        time.sleep(5)
+
+
+class NetBadge(VoiceBadge):
+    """Coral wifi-off badge on the pill while there is no internet. Not clickable."""
+
+    def __init__(self, island):
+        super().__init__(island)
+        self.icons = {'off': icon_svg(WIFI_OFF, RED)}
+        self.setToolTip('No internet')
+        self.setCursor(Qt.ArrowCursor)
+
+    def mousePressEvent(self, e):
+        e.ignore()
+
+
 def icon_png(size=180):
     """The island icon as PNG bytes, for the iPhone Home Screen (iOS wants PNG). Needs the Qt GUI thread."""
     img = QImage(size, size, QImage.Format_ARGB32)
-    img.fill(QColor(BG))
+    img.fill(QColor(THEME['ground']))
     p = QPainter(img)
     p.setRenderHint(QPainter.Antialiasing)
     p.setPen(Qt.NoPen)
@@ -2525,7 +2561,7 @@ class MoneyCalendar(QWidget):
             cell = QRectF(k % 7 * cw + 2, top + k // 7 * ch + 2, cw - 4, ch - 4)
             i, o = self.days.get(d, (0.0, 0.0))
             p.setPen(QPen(QColor(SAKURA), 1.5) if d == today else Qt.NoPen)
-            p.setBrush(QColor(THEME['sakura-tint'] if o and self.avg and o > self.avg * 1.5 else THEME['surface']))
+            p.setBrush(QColor(THEME['sakura-tint'] if o and self.avg and o > self.avg * 1.5 else CARD))
             p.drawRoundedRect(cell, 8, 8)
             p.setPen(QColor(FG if d == today else DIM))
             p.setFont(QFont(FONT, 7))
@@ -2730,7 +2766,7 @@ QPushButton#pill:hover {{ background:{LINE}; }}
 QPushButton#pill:pressed {{ background:{SAKURA}; color:{ON_SAKURA}; }}
 QMenu {{ background:{PANEL}; color:{FG}; border:none; }}
 QMenu::item:selected {{ background:{SAKURA}; color:{ON_SAKURA}; }}
-QListWidget {{ background:{THEME['surface']}; color:{FG}; border:none; border-radius:14px; padding:2px; font:9pt "{FONT}";
+QListWidget {{ background:{CARD}; color:{FG}; border:none; border-radius:14px; padding:2px; font:9pt "{FONT}";
                outline:0; }}
 QListWidget::item:selected {{ background:{THEME['sakura-tint']}; border-radius:8px; }}
 QCalendarWidget QWidget {{ background:{BG}; color:{FG}; alternate-background-color:{BG}; }}
@@ -2790,6 +2826,7 @@ class Island(QWidget):
         threading.Thread(target=self.sync_loop, daemon=True).start()
         self.set_everyric_local(self.settings['everyric_local'])
         threading.Thread(target=watch_discord, args=(self.settings, self.set_setting), daemon=True).start()
+        threading.Thread(target=watch_net, daemon=True).start()
         self.shape = self.target()
         self.morph()
         if first_run:  # a new user: say hello once the island is on screen
@@ -2840,8 +2877,8 @@ class Island(QWidget):
         self.c_wave = Wave(20, 14)
         self.c_timer = Text(10, ORANGE, bold=True, align=Qt.AlignRight)
         self.c_timer.setFixedWidth(46)
-        self.c_voice = VoiceBadge(self)
-        self.compact = row(self.c_art, self.c_text, self.c_wave, self.c_timer, self.c_voice, spacing=8)
+        self.c_voice, self.c_net = VoiceBadge(self), NetBadge(self)
+        self.compact = row(self.c_art, self.c_text, self.c_wave, self.c_timer, self.c_voice, self.c_net, spacing=8)
         self.compact.setParent(self)
         self.compact.layout().setContentsMargins(8, 6, 10, 6)  # near-even sides keep the clock centered
         self.petals = Petals(self)
@@ -3426,7 +3463,7 @@ class Island(QWidget):
         else:
             busy = self.alert or media.get('playing') or self.timer_end
             w = self.flash[3] if self.flash else 320 if busy else 290 if self.settings['fox'] else 190  # idle: date + fox
-            w += 34 * bool(self.c_voice.state)  # room for the Discord badge
+            w += 34 * (bool(self.c_voice.state) + bool(self.c_net.state))  # room for the Discord and offline badges
             h = COMPACT_H
         return QRectF((self.width() - w) / 2, TOP, w, h)
 
@@ -3749,6 +3786,7 @@ class Island(QWidget):
         st = discord_pick()[1]
         self.c_voice.set(('deaf' if st['deaf'] else 'mute' if st['mute'] else 'mic' if st['in_voice'] else None)
                          if st else None)
+        self.c_net.set(None if net['up'] else 'off')
         if not self.expanded:
             self.morph()
             return
