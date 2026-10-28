@@ -42,12 +42,12 @@ COMPACT_H, TOP, WIN = 36, 8, (820, 470)
 GEAR, LYRICS = '', ''
 SHELF, MONEY, CLAUDE = '', '', ''
 TABS = ['music', 'lyrics', 'shelf', 'money', 'system', 'claude', 'timer', 'calendar', 'settings']
-SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 434), 'system': (540, 220), 'claude': (700, 220),
+SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money': (720, 434), 'system': (640, 330), 'claude': (700, 220),
          'timer': (400, 180), 'calendar': (620, 284), 'settings': (800, 410), 'alert': (400, 160),
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.5.0'
+VERSION = '1.5.1'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -71,7 +71,7 @@ DEFAULTS = {'tiny_fullscreen': True, 'compact_lyrics': True, 'sound': True, 'scr
             'translation': None, 'pronunciation': None, 'auto_update': True, 'phone_sync': False, 'phone_key': None,
             'fox': True, 'fox_sleep': 7200, 'payday': 26, 'currency': '฿', 'prefs_mt': 0,
             'sync_url': None, 'sync_key': None,
-            'discord_id': '', 'discord_secret': '', 'discord_token': None,
+            'discord_id': '', 'discord_secret': '', 'discord_token': None, 'discord_tokens': {},
             'everyric_local': False, 'everyric_path': r'D:\code\Everyric2'}
 FOX_SLEEP_AFTER = [('30 min', 1800), ('1 hour', 3600), ('2 hours', 7200), ('3 hours', 10800)]
 TRANSLATIONS = [('Off', None), ('ไทย', 'th'), ('English', 'en'), ('日本語', 'ja')]
@@ -80,7 +80,7 @@ RUN_KEY, RUN_NAME = r'Software\Microsoft\Windows\CurrentVersion\Run', 'DynamicIs
 
 media = {}  # written by the media thread, read by the UI
 media_loop_ref = None  # media thread's asyncio loop, used for play/pause/skip
-top_procs = []  # [(name, cpu %, ram MB)], written by the process thread
+top_procs = []  # [(name, cpu %, ram MB, pid)], written by the process thread
 procs_wanted = threading.Event()  # set while the system tab is visible
 prefs = {'lang': None, 'romaji': False}  # what the lyric loader adds to each line
 
@@ -137,7 +137,7 @@ def scan_processes():
             time.sleep(delay)
             delay = 2
             cur, now = snapshot(), time.time()
-            usage = collections.defaultdict(lambda: [0.0, 0.0])
+            usage = collections.defaultdict(lambda: [0.0, 0.0, 0])
             for pid, (name, cpu, ram) in cur.items():
                 if pid == 0:  # Idle
                     continue
@@ -145,8 +145,63 @@ def scan_processes():
                 if prev.get(pid, ('',))[0] == name:  # same pid and name: not a reused pid
                     u[0] += (cpu - prev[pid][1]) / ((now - prev_t) * 1e7 * cores) * 100
                 u[1] += ram / 2**20
-            top_procs = sorted(((n, c, m) for n, (c, m) in usage.items()), key=lambda x: (-x[1], -x[2]))[:5]
+                u[2] = u[2] or pid
+            top_procs = sorted(((n, c, m, i) for n, (c, m, i) in usage.items()), key=lambda x: (-x[1], -x[2]))[:8]
             prev, prev_t = cur, now
+
+
+class Gpu:
+    """NVIDIA GPU load and power through the driver's own nvml.dll: no extra process, a few microseconds a call.
+    Other GPUs: values stay None and the cards say n/a."""
+
+    class Rates(ctypes.Structure):
+        _fields_ = [('gpu', ctypes.c_uint), ('memory', ctypes.c_uint)]
+
+    def __init__(self):
+        self.nvml, self.dev = None, ctypes.c_void_p()
+        try:
+            nvml = ctypes.WinDLL('nvml.dll')
+            if nvml.nvmlInit_v2() == 0 and nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(self.dev)) == 0:
+                self.nvml = nvml
+        except OSError:
+            pass
+
+    def read(self):
+        """(load %, watts, power limit watts) or (None, None, None)."""
+        if not self.nvml:
+            return None, None, None
+        r, mw, lim = self.Rates(), ctypes.c_uint(), ctypes.c_uint()
+        ok = self.nvml.nvmlDeviceGetUtilizationRates(self.dev, ctypes.byref(r)) == 0
+        self.nvml.nvmlDeviceGetPowerUsage(self.dev, ctypes.byref(mw))
+        self.nvml.nvmlDeviceGetEnforcedPowerLimit(self.dev, ctypes.byref(lim))
+        return (r.gpu if ok else None), mw.value / 1000, (lim.value / 1000 or None)
+
+
+class CpuClock:
+    """The real CPU clock: Windows reports only the base clock, so scale it by the "% Processor Performance"
+    counter (above 100 % while boosting), read through PDH."""
+
+    class Value(ctypes.Structure):
+        _fields_ = [('status', ctypes.c_ulong), ('pad', ctypes.c_ulong), ('value', ctypes.c_double)]
+
+    def __init__(self):
+        self.base = (psutil.cpu_freq().max or 0) / 1000
+        self.pdh, self.query, self.counter = ctypes.windll.pdh, ctypes.c_void_p(), ctypes.c_void_p()
+        ok = self.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) == 0 and self.pdh.PdhAddEnglishCounterW(
+            self.query, r'\Processor Information(_Total)\% Processor Performance', 0, ctypes.byref(self.counter)) == 0
+        if ok:
+            self.pdh.PdhCollectQueryData(self.query)
+        else:
+            self.counter = None
+
+    def ghz(self):
+        if not self.counter:
+            return self.base
+        v = self.Value()
+        self.pdh.PdhCollectQueryData(self.query)
+        if self.pdh.PdhGetFormattedCounterValue(self.counter, 0x200, None, ctypes.byref(v)) != 0:  # PDH_FMT_DOUBLE
+            return self.base
+        return self.base * v.value / 100
 
 
 def load_reminders():
@@ -1032,14 +1087,25 @@ def watch_claude():
 # Settings; Discord asks once to allow it. Docs: https://docs.discord.com/developers/topics/rpc
 DISCORD_SCOPES = ['rpc', 'rpc.voice.read', 'rpc.voice.write']
 DISCORD_REDIRECT = 'http://127.0.0.1'  # must be listed under the app's OAuth2 redirects
-discord = {'status': '', 'in_voice': False, 'mute': False, 'deaf': False}  # written by the Discord thread
+discord = {'status': ''}  # written by the Discord threads
+discord_clients = {}  # pipe number -> {'in_voice', 'mute', 'deaf'}: stable, PTB and Canary each have their own
+
+
+def discord_pipes():
+    return sorted(int(n.rsplit('-', 1)[1]) for n in os.listdir(r'\\.\pipe\\') if re.fullmatch(r'discord-ipc-\d', n))
+
+
+def discord_pick():
+    """(pipe, state) of the Discord app that matters: the one in a voice channel, else any connected one."""
+    live = list(discord_clients.items())
+    return next((c for c in live if c[1]['in_voice']), live[0] if live else (None, None))
 
 
 class DiscordPipe:
     """One connection to the Discord app: 8-byte header (opcode, length) then JSON."""
 
-    def __init__(self, client_id):
-        for i in range(10):
+    def __init__(self, client_id, index=None):
+        for i in range(10) if index is None else (index,):
             try:
                 self.f = open(rf'\\.\pipe\discord-ipc-{i}', 'r+b', buffering=0)
                 break
@@ -1098,69 +1164,101 @@ def discord_token(settings, save, body):
     return t
 
 
-def discord_login(pipe, settings, save):
-    """AUTHENTICATE with a saved token, refreshing it or asking Discord to allow the app when needed."""
-    t = settings['discord_token']
+def discord_login(pipe, settings, save, slot):
+    """AUTHENTICATE with a saved token, refreshing it or asking Discord to allow the app when needed.
+    Each Discord app (pipe slot) may be logged in to another account, so each keeps its own token."""
+    tokens = dict(settings.get('discord_tokens') or {})
+
+    def keep(t):
+        tokens[slot] = t
+        save('discord_tokens', tokens)
+        save('discord_token', t)
+        return t
+    t = tokens.get(slot) or settings['discord_token']
     if t and t.get('expires_at', 0) < time.time() and t.get('refresh_token'):
         try:
-            t = discord_token(settings, save, {'grant_type': 'refresh_token', 'refresh_token': t['refresh_token']})
+            t = keep(discord_token(settings, save, {'grant_type': 'refresh_token', 'refresh_token': t['refresh_token']}))
         except OSError:
             t = None
     if t:
         try:
-            return pipe.call('AUTHENTICATE', {'access_token': t['access_token']})
-        except PermissionError:  # revoked or for another app
-            save('discord_token', None)
+            pipe.call('AUTHENTICATE', {'access_token': t['access_token']})
+            return keep(t)
+        except PermissionError:  # revoked, for another app, or another account
+            pass
     discord['status'] = 'click Authorize in Discord'
     code = pipe.call('AUTHORIZE', {'client_id': settings['discord_id'], 'scopes': DISCORD_SCOPES})['code']
-    t = discord_token(settings, save, {'grant_type': 'authorization_code', 'code': code})
-    return pipe.call('AUTHENTICATE', {'access_token': t['access_token']})
+    t = keep(discord_token(settings, save, {'grant_type': 'authorization_code', 'code': code}))
+    pipe.call('AUTHENTICATE', {'access_token': t['access_token']})
+    return t
 
 
 def watch_discord(settings, save):
-    """Keep one connection open and follow voice state; reconnect when Discord restarts."""
-    while True:
-        if not (settings['discord_id'] and settings['discord_secret']):
-            discord.update(status='', in_voice=False)
-            time.sleep(5)
-            continue
+    """One watcher per running Discord app (stable, PTB, Canary): each has its own pipe and voice state."""
+    running = set()
+
+    def watch(slot):
         try:
-            pipe = DiscordPipe(settings['discord_id'])
-            discord_login(pipe, settings, save)
+            pipe = DiscordPipe(settings['discord_id'], slot)
+            discord_login(pipe, settings, save, str(slot))
+            state = discord_clients[slot] = {'in_voice': False, 'mute': False, 'deaf': False}
 
             def on_event(m):
                 if m.get('evt') == 'VOICE_SETTINGS_UPDATE':
-                    discord.update(mute=m['data']['mute'], deaf=m['data']['deaf'])
+                    state.update(mute=m['data']['mute'], deaf=m['data']['deaf'])
                 elif m.get('evt') == 'VOICE_CHANNEL_SELECT':
-                    discord['in_voice'] = bool(m['data'].get('channel_id'))
+                    state['in_voice'] = bool(m['data'].get('channel_id'))
             pipe.on_event = on_event
             v = pipe.call('GET_VOICE_SETTINGS')
-            discord.update(mute=v['mute'], deaf=v['deaf'],
-                           in_voice=bool(pipe.call('GET_SELECTED_VOICE_CHANNEL')), status='connected')
+            state.update(mute=v['mute'], deaf=v['deaf'], in_voice=bool(pipe.call('GET_SELECTED_VOICE_CHANNEL')))
             pipe.call('SUBSCRIBE', evt='VOICE_SETTINGS_UPDATE')
             pipe.call('SUBSCRIBE', evt='VOICE_CHANNEL_SELECT')
+            discord['status'] = 'connected'
             while True:
                 on_event(pipe.recv())
         except (OSError, ValueError, KeyError, TypeError, PermissionError) as e:
-            discord.update(in_voice=False, status='open Discord' if isinstance(e, ConnectionError) and
-                           'running' in str(e) else str(e)[:40] or 'Discord error')
+            if not discord_clients:
+                discord['status'] = str(e)[:40] or 'Discord error'
+        finally:
+            discord_clients.pop(slot, None)
+            running.discard(slot)
+
+    while True:
+        if settings['discord_id'] and settings['discord_secret']:
+            pipes = discord_pipes()
+            if not pipes:
+                discord['status'] = 'open Discord'
+            for slot in pipes:
+                if slot not in running:
+                    running.add(slot)
+                    threading.Thread(target=watch, args=(slot,), daemon=True).start()
+        else:
+            discord['status'] = ''
         time.sleep(10)
 
 
 def discord_toggle(settings, what):
-    """Flip mute or deafen on a second connection: the watching one is busy waiting for events."""
+    """Flip mute or deafen in the Discord app that is in voice, on a second connection (the watching one is
+    busy waiting for events)."""
+    slot, state = discord_pick()
+    if state is None:
+        return
+
     def run():
         try:
-            pipe = DiscordPipe(settings['discord_id'])
-            pipe.call('AUTHENTICATE', {'access_token': settings['discord_token']['access_token']})
-            pipe.call('SET_VOICE_SETTINGS', {what: not discord[what]})
+            pipe = DiscordPipe(settings['discord_id'], slot)
+            token = (settings.get('discord_tokens') or {}).get(str(slot)) or settings['discord_token']
+            pipe.call('AUTHENTICATE', {'access_token': token['access_token']})
+            pipe.call('SET_VOICE_SETTINGS', {what: not state[what]})
             pipe.close()
         except (OSError, ValueError, KeyError, TypeError, PermissionError):
             pass  # the badge simply stays as it is
     threading.Thread(target=run, daemon=True).start()
 
 
-# MynaUI outlines (MIT): microphone-off, and headphones with a slash for deafened
+# MynaUI outlines (MIT): microphone, microphone-off, and headphones with a slash for deafened
+MIC = ('<path d="M16 6.429C16 4.535 14.21 3 12 3S8 4.535 8 6.429v5.142C8 13.465 9.79 15 12 15s4-1.535 '
+       '4-3.429z"/><path d="M5 11a7 7 0 1 0 14 0m-7 7v3m-4 0h8"/>')
 MIC_OFF = ('<path d="M12 18v3m-4 0h8m-8-9.429V6.43C8 4.535 9.79 3 12 3c1.309 0 2.47.539 3.2 1.371M5 11c0 1.046.23 '
            '2.039.641 2.93M19 11a7 7 0 0 1-11.425 5.425m2.077-2.077-2.077 2.077L3 21M21 3l-5 5m0 0v3.571C16 13.465 '
            '14.21 15 12 15a4.44 4.44 0 0 1-2.348-.652M16 8l-6.348 6.348"/>')
@@ -1178,16 +1276,16 @@ def icon_svg(paths, color):
 
 
 class VoiceBadge(QWidget):
-    """Round coral badge at the pill's right end while muted or deafened in a Discord voice channel.
-    Click: mute on/off. Right-click: deafen on/off. Hovering it does not open the island."""
+    """Badge at the pill's right end: coral mic-off / headphones-off while muted or deafened in Discord, a mint
+    mic while in voice and live. Click: mute on/off. Right-click: deafen on/off. Hovering it doesn't open the island."""
 
     def __init__(self, island):
         super().__init__()
         self.island, self.state = island, None
         self.setFixedSize(26, 26)
         self.setCursor(Qt.PointingHandCursor)
-        self.icons = {'mute': icon_svg(MIC_OFF, RED), 'deaf': icon_svg(HEADPHONES_OFF, RED)}
-        self.setToolTip('Discord: click to unmute, right-click to undeafen')
+        self.icons = {'mute': icon_svg(MIC_OFF, RED), 'deaf': icon_svg(HEADPHONES_OFF, RED), 'mic': icon_svg(MIC, GREEN)}
+        self.setToolTip('Discord: click to mute or unmute, right-click to deafen or undeafen')
         self.hide()
 
     def set(self, state):
@@ -1200,7 +1298,7 @@ class VoiceBadge(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(THEME['sakura-tint']))
+        p.setBrush(QColor('#1f3a30' if self.state == 'mic' else THEME['sakura-tint']))  # live mic: mint
         p.drawEllipse(self.rect())
         if self.state:
             self.icons[self.state].render(p, QRectF(5, 5, 16, 16))
@@ -1815,6 +1913,102 @@ class Graph(QWidget):  # last 60 s of a percentage, filled line chart
         p.drawText(QRectF(0, 0, w, 16), Qt.AlignLeft | Qt.AlignVCenter, self.name)
         p.setPen(self.color)
         p.drawText(QRectF(0, 0, w, 16), Qt.AlignRight | Qt.AlignVCenter, f'{self.values[-1]:.0f}%')
+
+
+class StatCard(QWidget):
+    """A small tile: name, value, and a sparkline of the last 30 s behind them."""
+
+    def __init__(self, name, color):
+        super().__init__()
+        self.setFixedHeight(42)
+        self.name, self.color, self.value = name, QColor(color), ''
+        self.values = collections.deque([0.0] * 30, maxlen=30)
+
+    def set(self, value, level):  # level 0..1 for the sparkline
+        self.value = value
+        self.values.append(max(0.0, min(1.0, level)))
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(PANEL))
+        p.drawRoundedRect(QRectF(0, 0, w, h), 10, 10)
+        line = QPainterPath()
+        for i, v in enumerate(self.values):
+            pt = QPointF(4 + (w - 8) * i / 29, h - 4 - (h - 18) * v)
+            line.lineTo(pt) if i else line.moveTo(pt)
+        c = QColor(self.color)
+        c.setAlpha(150)
+        p.setPen(QPen(c, 1.2))
+        p.drawPath(line)
+        p.setPen(QColor(DIM))
+        p.setFont(QFont(FONT, 7))
+        p.drawText(QRectF(8, 3, w - 12, 14), Qt.AlignLeft | Qt.AlignVCenter, self.name)
+        p.setPen(QColor(FG))
+        p.setFont(QFont(FONT, 9, QFont.Bold))
+        p.drawText(QRectF(8, 17, w - 12, 20), Qt.AlignLeft | Qt.AlignVCenter, self.value)
+
+
+class Ring(QWidget):
+    """A round gauge: value in the middle, caption under it."""
+
+    def __init__(self, size, color, caption, font=11):
+        super().__init__()
+        self.setFixedSize(size, size + (16 if caption else 0))
+        self.d, self.color, self.caption, self.font, self.frac, self.text = size, QColor(color), caption, font, 0.0, ''
+
+    def set(self, frac, text):
+        if (frac, text) != (self.frac, self.text):
+            self.frac, self.text = frac, text
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = max(5.0, self.d / 14)
+        r = QRectF(pen / 2 + 1, pen / 2 + 1, self.d - pen - 2, self.d - pen - 2)
+        p.setPen(QPen(QColor(LINE), pen, Qt.SolidLine, Qt.RoundCap))
+        p.drawEllipse(r)
+        if self.frac > 0:
+            p.setPen(QPen(self.color, pen, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(r, 90 * 16, -int(min(self.frac, 1) * 360 * 16))
+        p.setPen(QColor(FG))
+        p.setFont(QFont(ROUND, self.font, QFont.Bold))
+        p.drawText(QRectF(0, 0, self.d, self.d), Qt.AlignCenter, self.text)
+        if self.caption:
+            p.setPen(QColor(DIM))
+            p.setFont(QFont(FONT, 7))
+            p.drawText(QRectF(0, self.d + 1, self.d, 14), Qt.AlignCenter, self.caption)
+
+
+class CoreBars(QWidget):
+    """Load of each logical CPU core, one bar each."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(56)
+        self.loads = []
+
+    def set(self, loads):
+        self.loads = loads
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        n = max(1, len(self.loads))
+        slot = self.width() / n
+        for i, v in enumerate(self.loads):
+            x = i * slot + slot * 0.15
+            p.setBrush(QColor(PANEL))
+            p.drawRoundedRect(QRectF(x, 0, slot * 0.7, self.height()), 3, 3)
+            h = max(2.0, self.height() * v / 100)
+            p.setBrush(QColor(SAKURA if v > 70 else BLUE))
+            p.drawRoundedRect(QRectF(x, self.height() - h, slot * 0.7, h), 3, 3)
 
 
 class Lyrics(QWidget):
@@ -2758,20 +2952,40 @@ class Island(QWidget):
                                               spacing=3), self.u_bars, spacing=16)
         claude_page.layout().setStretch(1, 1)
 
-        # system page: graphs | top programs
-        self.g_cpu, self.g_ram = Graph('CPU', BLUE), Graph('RAM', PURPLE)
-        self.s_extra = Text(8, DIM)
-        self.procs = [(Text(9), Text(9, BLUE, align=Qt.AlignRight), Text(9, DIM, align=Qt.AlignRight))
-                      for _ in range(5)]
-        for _, cpu, ram in self.procs:
-            cpu.setFixedWidth(44)
-            ram.setFixedWidth(64)
-        heading = Text(8, DIM)
-        heading.set('TOP PROGRAMS')
-        system_page = row(column(self.g_cpu, self.g_ram, self.s_extra, spacing=4),
-                          column(heading, *(row(*r, spacing=4) for r in self.procs), None, spacing=3), spacing=18)
-        for i in (0, 1):
-            system_page.layout().setStretch(i, 1)
+        # system page: cards | rings and details | usage history and cores | top programs
+        self.gpu, self.clock, self.io_prev = Gpu(), CpuClock(), None
+        self.cards = {k: StatCard(k, c) for k, c in (('CPU', SAKURA), ('GPU', PURPLE), ('Memory', BLUE),
+                                                     ('Drives', THEME['butter']), ('Network', GREEN),
+                                                     ('GPU power', ORANGE))}
+        self.r_power, self.r_cpu = Ring(62, ORANGE, 'GPU power'), Ring(92, SAKURA, '', 16)
+        self.r_clock = Ring(62, BLUE, 'GHz')
+        self.d_rows = [(Text(9, c), Text(9, align=Qt.AlignRight)) for c in (RED, BLUE, DIM, DIM, DIM)]
+        for (label, value), name in zip(self.d_rows, ('●  System', '●  User', '●  Idle', 'Threads', 'Uptime')):
+            label.set(name)
+            value.setFixedWidth(60)
+        self.g_cpu = Graph('Usage history', SAKURA)
+        self.g_cpu.setFixedHeight(110)
+        self.cores = CoreBars()
+        self.procs = [(QLabel(), Text(9), Text(9, DIM, align=Qt.AlignRight)) for _ in range(8)]
+        for icon, _, cpu in self.procs:
+            icon.setFixedSize(16, 16)
+            cpu.setFixedWidth(42)
+        self.icon_cache, self.icon_provider = {}, QFileIconProvider()
+
+        def label(text):
+            t = Text(7, FAINT, align=Qt.AlignCenter)
+            t.set(text)
+            return t
+        system_page = column(
+            row(*self.cards.values(), spacing=6),
+            row(column(row(self.r_power, self.r_cpu, self.r_clock, spacing=4), label('DETAILS'),
+                       *(row(a, b, spacing=4) for a, b in self.d_rows), None, spacing=2),
+                column(self.g_cpu, label('PER CORE'), self.cores, None, spacing=4),
+                column(label('TOP PROCESSES'), *(row(*r, spacing=6) for r in self.procs), None, spacing=2),
+                spacing=16),
+            spacing=10)
+        for i in range(3):
+            system_page.layout().itemAt(1).widget().layout().setStretch(i, 1)
 
         # timer page: big countdown, presets
         self.t_big = Text(30, ORANGE, bold=True, align=Qt.AlignCenter, family=ROUND)
@@ -3250,10 +3464,13 @@ class Island(QWidget):
         # a new page is laid out at its final size: it fades in once the box has nearly grown, so no text shows
         # outside the box. No setMask on the page: it kept the calendar from painting on the layered window.
         run = self.anim.state() == QVariantAnimation.Running
-        fade = max(0.0, min(1.0, (self.anim.currentTime() / self.anim.duration() - 0.4) / 0.4)) if run else 1.0
+        t = self.anim.currentTime() / self.anim.duration() if run else 1.0
+        fade = max(0.0, min(1.0, (t - 0.5) / 0.35))
         shown = max(0.0, k * 2 - 1) * fade if self.expanded else 0
         self.compact.setVisible(k < 0.25 and r.height() > COMPACT_H - 8)  # hidden in the tiny pill
-        self.full.setVisible(self.expanded and k > 0.5)
+        # the veil only covers the box: while the box is still smaller than the page, the page stays hidden
+        # (the spring is at full size by half time), else its edges show outside the box
+        self.full.setVisible(self.expanded and k > 0.5 and t >= 0.5)
         self.veil.cover(r, 1 - shown if self.full.isVisible() else 0)
         # no setMask: the window is layered, so its transparent pixels already let clicks through, and changing
         # the window region left the old pixels behind as a square black box until the next full repaint
@@ -3402,19 +3619,57 @@ class Island(QWidget):
         QTimer.singleShot(1200, self.maybe_collapse)
 
     def stats(self):
-        ram = psutil.virtual_memory()
-        self.g_cpu.add(psutil.cpu_percent())
-        self.g_ram.add(ram.percent)
-        if not (self.expanded and self.page() == 'system'):  # graphs keep their history, the rest can wait
+        cpu = psutil.cpu_percent()
+        self.g_cpu.add(cpu)  # history keeps running; the rest is read only while the page is open
+        if not (self.expanded and self.page() == 'system'):
+            self.io_prev = None
             return
-        bat = psutil.sensors_battery()
-        self.s_extra.set(f'RAM {ram.used / 2**30:.1f} / {ram.total / 2**30:.0f} GB   '
-                         f'DISK C {psutil.disk_usage("C:\\").percent:.0f}%'
-                         + (f'   BAT {bat.percent:.0f}%{" ⚡" if bat.power_plugged else ""}' if bat else ''))
-        for (name, cpu, ram_t), proc in zip(self.procs, top_procs + [None] * 5):
+        ram, now = psutil.virtual_memory(), time.time()
+        disk, net = psutil.disk_io_counters(), psutil.net_io_counters()
+        io = (now, disk.read_bytes + disk.write_bytes, net.bytes_recv + net.bytes_sent)
+        rate = [(b - a) / max(0.1, io[0] - self.io_prev[0]) for a, b in zip(self.io_prev[1:], io[1:])] \
+            if self.io_prev else [0, 0]
+        self.io_prev = io
+        gpu, watts, limit = self.gpu.read()
+
+        def speed(b):  # bytes/s -> "33 KB/s"
+            for unit in ('B', 'KB', 'MB', 'GB'):
+                if b < 1000 or unit == 'GB':
+                    return f'{b:.0f} {unit}/s' if unit == 'B' else f'{b:.1f} {unit}/s' if b < 10 else f'{b:.0f} {unit}/s'
+                b /= 1000
+        c = self.cards
+        c['CPU'].set(f'{cpu:.0f}%', cpu / 100)
+        c['GPU'].set(f'{gpu}%' if gpu is not None else 'n/a', (gpu or 0) / 100)
+        c['Memory'].set(f'{ram.percent:.0f}%', ram.percent / 100)
+        c['Drives'].set(speed(rate[0]), min(1, rate[0] / 200e6))
+        c['Network'].set(speed(rate[1]), min(1, rate[1] / 10e6))
+        c['GPU power'].set(f'{watts:.0f} W' if watts is not None else 'n/a', (watts or 0) / (limit or 1))
+        self.r_power.set((watts or 0) / (limit or 1), f'{watts:.0f} W' if watts is not None else '–')
+        self.r_cpu.set(cpu / 100, f'{cpu:.0f}%')
+        ghz = self.clock.ghz()
+        self.r_clock.set(min(1, ghz / max(0.1, self.clock.base * 1.3)), f'{ghz:.2f}')
+        t = psutil.cpu_times_percent()
+        up = int(now - psutil.boot_time())
+        for (_, value), text in zip(self.d_rows, (f'{t.system:.0f}%', f'{t.user:.0f}%', f'{t.idle:.0f}%',
+                                                   str(psutil.cpu_count()),
+                                                   f'{up // 86400} d {up % 86400 // 3600} h' if up >= 86400 else
+                                                   f'{up // 3600} h {up % 3600 // 60} min' if up >= 3600 else f'{up // 60} min')):
+            value.set(text)
+        self.cores.set(psutil.cpu_percent(percpu=True))
+        for (icon, name, load), proc in zip(self.procs, top_procs + [None] * 8):
             name.set(proc[0] if proc else '')
-            cpu.set(f'{proc[1]:.1f}%' if proc else '')
-            ram_t.set(f'{proc[2]:,.0f} MB' if proc else '')
+            load.set(f'{proc[1]:.1f}%' if proc else '')
+            icon.setPixmap(self.proc_icon(proc) if proc else QPixmap())
+
+    def proc_icon(self, proc):
+        """The program's own icon, looked up once per name."""
+        if proc[0] not in self.icon_cache:
+            try:
+                path = psutil.Process(proc[3]).exe()
+            except (psutil.Error, OSError):
+                path = ''
+            self.icon_cache[proc[0]] = self.icon_provider.icon(QFileInfo(path)).pixmap(16, 16) if path else QPixmap()
+        return self.icon_cache[proc[0]]
 
     def tick(self):
         now = time.time()
@@ -3490,7 +3745,10 @@ class Island(QWidget):
         want = self.expanded and page == 'system'
         if want != procs_wanted.is_set():
             procs_wanted.set() if want else procs_wanted.clear()
-        self.c_voice.set(('deaf' if discord['deaf'] else 'mute' if discord['mute'] else None) if discord['in_voice'] else None)
+        # muted or deafened: always (a reminder before joining, Discord keeps self-mute); a live mic: only in voice
+        st = discord_pick()[1]
+        self.c_voice.set(('deaf' if st['deaf'] else 'mute' if st['mute'] else 'mic' if st['in_voice'] else None)
+                         if st else None)
         if not self.expanded:
             self.morph()
             return
