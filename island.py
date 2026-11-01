@@ -50,7 +50,7 @@ SIZES = {'music': (460, 200), 'lyrics': (560, 260), 'shelf': (540, 210), 'money'
          'guide': (600, 300)}
 LEAD = 0.3  # seconds a lyric line shows before it is sung
 TINY = (110, 8)  # island while a fullscreen app or game is in front
-VERSION = '1.6.0'
+VERSION = '1.6.1'
 REPO = 'mihoshiho/dynamic-island'  # auto-update reads this repo's latest GitHub release
 FROZEN = getattr(sys, 'frozen', False)  # running as the installed .exe
 DATA = pathlib.Path(os.environ.get('APPDATA') or pathlib.Path.home()) / 'DynamicIsland'  # Program files is read-only
@@ -1433,26 +1433,39 @@ def idle_seconds():
     return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000
 
 
+# full-screen windows that are not games: the keyboard / emoji panel host and the NVIDIA overlay
+NOT_FULLSCREEN = {'TextInputHost.exe', 'NVIDIA Overlay.exe', 'ShellExperienceHost.exe', 'StartMenuExperienceHost.exe'}
+
+
 def fullscreen_in_front(own_hwnd):
-    """True when the foreground window covers the whole monitor the island is on (game, fullscreen video)."""
+    """Name of the app when the foreground window covers the whole monitor the island is on (game, fullscreen
+    video), else None. A maximized window also covers it since the taskbar is hidden, so that one never counts."""
     user32 = ctypes.windll.user32
     user32.GetForegroundWindow.restype = user32.MonitorFromWindow.restype = ctypes.c_void_p
     user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
     hwnd = user32.GetForegroundWindow()
-    if not hwnd or hwnd == own_hwnd:
-        return False
+    if not hwnd or hwnd == own_hwnd or user32.IsZoomed(ctypes.c_void_p(hwnd)):
+        return None
     cls = ctypes.create_unicode_buffer(64)
     user32.GetClassNameW(ctypes.c_void_p(hwnd), cls, 64)
     if cls.value in ('Progman', 'WorkerW', 'Shell_TrayWnd'):  # desktop and taskbar also span the screen
-        return False
+        return None
     mon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
     if mon != user32.MonitorFromWindow(own_hwnd, 2):
-        return False
+        return None
     info, r = MonitorInfo(cbSize=ctypes.sizeof(MonitorInfo)), Rect()
     user32.GetMonitorInfoW(ctypes.c_void_p(mon), ctypes.byref(info))
     user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r))
     m = info.rcMonitor
-    return r.left <= m.left and r.top <= m.top and r.right >= m.right and r.bottom >= m.bottom
+    if not (r.left <= m.left and r.top <= m.top and r.right >= m.right and r.bottom >= m.bottom):
+        return None
+    pid = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+    try:
+        name = psutil.Process(pid.value).name()
+    except psutil.Error:
+        return None
+    return None if name in NOT_FULLSCREEN else name
 
 
 # ---------- lyrics ----------
@@ -3517,6 +3530,9 @@ class Island(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
+        if self.tiny and not self.expanded:  # a near-invisible pad round the thin line: easy to hover open
+            p.setBrush(QColor(0, 0, 0, 1))
+            p.drawRect(self.shape.adjusted(-40, -2, 40, 14))
         p.setBrush(QColor(BG))
         r = min(self.shape.height() / 2, 34)
         p.drawRoundedRect(self.shape, r, r)
@@ -3724,7 +3740,10 @@ class Island(QWidget):
             self.dismiss()
         if now - self.fs_at >= 0.5:  # fullscreen check twice a second
             self.fs_at = now
-            self.tiny = self.settings['tiny_fullscreen'] and fullscreen_in_front(int(self.winId()))
+            app = self.settings['tiny_fullscreen'] and fullscreen_in_front(int(self.winId()))
+            if app and not self.tiny:
+                print(f'{dt.datetime.now():%Y-%m-%d %H:%M} tiny: {app} is fullscreen', file=sys.stderr)
+            self.tiny = bool(app)
         if money_last['at']:  # a new transaction from the iPhone, not shown yet
             tx = money_last['tx']
             self.flash = (f'{"+" if tx["kind"] == "in" else "−"}{tx["amount"]:,.2f} {money_prefs["currency"]}  ·  '
